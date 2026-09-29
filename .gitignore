@@ -1,0 +1,14 @@
+node_modules/
+.cache/
+release/
+tmp/
+vendor/openlist.exe
+*.log
+*.db
+*.db-*
+data/
+credentials*
+tasks.json
+settings.json
+.env
+.env.*

@@ -1,0 +1,27 @@
+# 桌面界面
+
+界面位于 `src/renderer/`，使用原生 HTML、CSS 和 JavaScript，由 Electron 预载的 `window.bridge` 提供服务。直接在浏览器打开时会明确提示需要桌面运行环境，不会展示假账号或假传输记录。
+
+- 左侧夸克、右侧 115，各自保存目录与选择状态。单击行或复选框选择，点击文件夹名称、双击文件夹行或按 Enter 进入。
+- 面包屑、上一级和刷新均只作用于对应网盘。服务器状态推送不会重置选择；同目录刷新只移除已经不存在的选中项。
+- 复制前展示实际来源和目标目录，并解释保留源文件、同名文件序号、文件夹合并以及本机中转。
+- 账号弹窗优先调用扫码或网页登录；手动凭证仅支持夸克 Cookie 和 115 Open 的 Access/Refresh Token，115 两个令牌都必须填写。输入框使用 password 类型，关闭弹窗或保存成功后清空。
+- 任务区显示整批已完成文件/字节进度、当前阶段、失败原因及重试/取消。暂停和继续控制整条队列，暂停提示明确当前阶段结束后停止。空目录、未连接、读取失败、服务启动及服务错误都有专门状态。
+- 缓存目录选择由主进程显示原生目录选择器。可以打开缓存、数据及日志目录。
+- 页面不使用框架、外部字体或网络资源。严格 CSP 禁用内联脚本、对象、表单提交；所有外部文件名、路径和错误通过 `textContent` 写入 DOM，没有 `innerHTML`。
+
+适配基线为桌面窗口宽度 820px 以上。主进程宜设置最小窗口尺寸至少 900 × 690，默认约 1200 × 850。
+
+## 预载 API 约定
+
+`getState()`、`list({side,path,refresh})`、`login({side})`、`saveCredentials({side,cookie?,accessToken?,refreshToken?})`、`chooseCache()`、`startTransfer({side,sourceDir,names,targetDir})`、`pauseQueue()`、`resumeQueue()`、`cancelJob(id)`、`retryJob(id)`、`openFolder({kind})`、`onState(callback)`。
+
+`stageProgress` 约定为 0–100 的阶段百分比。状态事件中的 `jobs` 按创建先后排序，界面从最新任务开始显示。账号错误信息可通过 `accounts[side].message` 提供。只有后端将任务标记为 `completed`，界面才展示“目录、数量和大小已核对”。
+
+凭证由本机引擎保存在私有数据目录，应用日志不记录凭证。OpenList 数据库未额外加密。后端负责限制 IPC 路径、打开外部登录页面、执行及持久化任务、验证结果；渲染界面不执行本地文件系统和网盘调用。
+
+## 验证
+
+`node --check src/renderer/app.js` 通过。`tests/ui-contract.test.js` 使用隔离浏览器上下文注入开发用 bridge，实际操作页面验证选择在状态更新后保留、复制参数、文件夹导航、115 凭证必填及清空、文件名/错误文本注入防护和无桌面服务时的明确状态。已通过真实 Chromium 测试，并检查 1200 × 850 截图；示例账号与文件不会进入交付页面。
+
+该测试在未安装 Playwright 时自动跳过；可安装开发依赖或设置 `UI_TEST_PLAYWRIGHT` 为现有 Playwright 模块绝对路径，`UI_TEST_CHROMIUM` 为本机 Chromium 可执行文件绝对路径后运行。显式指定无效模块时测试失败，不会静默跳过。可选 `UI_TEST_SCREENSHOT` 写出开发截图。

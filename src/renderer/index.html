@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>双向云桥 · 夸克与 115 文件互传</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand"><div class="brand-mark" aria-hidden="true">⇄</div><div><h1>双向云桥 <span>OpenList</span></h1><p>夸克与 115，文件轻松互传</p></div></div>
+      <div class="header-actions"><span id="engine-status" class="engine-status"><i></i><span>正在启动本地服务</span></span><button class="button icon-button" id="settings-button" type="button" aria-label="打开设置">⚙ <span>设置</span></button></div>
+    </header>
+
+    <div id="startup-banner" class="notice" role="status"><span class="spinner" aria-hidden="true"></span><div><strong id="startup-title">正在准备传输环境</strong><span id="startup-description">首次启动可能需要一点时间，准备好后即可连接网盘。</span></div><button class="button small" id="startup-logs" type="button" hidden>查看日志</button></div>
+
+    <main>
+      <div class="workspace-heading"><div><h2>我的网盘</h2><p>选择文件或文件夹，复制到另一侧当前目录</p></div><span class="local-badge"><span aria-hidden="true">●</span> 本机中转 · 保留源文件</span></div>
+
+      <section class="drive-workspace" aria-label="网盘文件管理">
+        <article class="drive-panel quark" data-side="quark" aria-labelledby="quark-title">
+          <div class="drive-header"><div class="drive-identity"><div class="drive-logo" aria-hidden="true">Q</div><div><h3 id="quark-title">夸克网盘</h3><span class="account-status" id="quark-account-status">尚未连接</span></div></div><button class="button small account-button" data-action="account" data-side="quark" type="button">连接账号</button></div>
+          <div class="path-toolbar"><button class="button square" data-action="up" data-side="quark" type="button" aria-label="夸克返回上一级" title="返回上一级" disabled>↑</button><nav class="breadcrumbs" id="quark-breadcrumbs" aria-label="夸克当前位置"></nav><button class="button square refresh-button" data-action="refresh" data-side="quark" type="button" aria-label="刷新夸克文件列表" title="刷新" disabled>↻</button></div>
+          <div class="file-table-header"><label class="select-all-label"><input type="checkbox" id="quark-select-all" aria-label="全选夸克当前目录" disabled><span>文件名称</span></label><span>大小</span></div>
+          <div class="file-area" id="quark-file-area" tabindex="0" aria-label="夸克文件列表"><div class="empty-state"><div class="empty-cloud" aria-hidden="true">☁</div><h4>连接你的夸克网盘</h4><p>登录后，即可浏览和选择文件</p><button class="button primary" data-action="account" data-side="quark" type="button">连接夸克</button></div></div>
+          <div class="drive-footer"><span id="quark-summary">0 个项目</span><span id="quark-selection">未选择文件</span></div>
+        </article>
+
+        <div class="transfer-controls"><button class="transfer-button to-115" id="copy-to-115" type="button" disabled aria-label="将夸克选中文件复制到 115" title="复制到 115"><span aria-hidden="true">→</span><span>到 115</span></button><span class="transfer-line" aria-hidden="true"></span><button class="transfer-button to-quark" id="copy-to-quark" type="button" disabled aria-label="将 115 选中文件复制到夸克" title="复制到夸克"><span aria-hidden="true">←</span><span>到夸克</span></button></div>
+
+        <article class="drive-panel pan115" data-side="pan115" aria-labelledby="pan115-title">
+          <div class="drive-header"><div class="drive-identity"><div class="drive-logo" aria-hidden="true">115</div><div><h3 id="pan115-title">115 网盘</h3><span class="account-status" id="pan115-account-status">尚未连接</span></div></div><button class="button small account-button" data-action="account" data-side="pan115" type="button">连接账号</button></div>
+          <div class="path-toolbar"><button class="button square" data-action="up" data-side="pan115" type="button" aria-label="115 返回上一级" title="返回上一级" disabled>↑</button><nav class="breadcrumbs" id="pan115-breadcrumbs" aria-label="115 当前位置"></nav><button class="button square refresh-button" data-action="refresh" data-side="pan115" type="button" aria-label="刷新 115 文件列表" title="刷新" disabled>↻</button></div>
+          <div class="file-table-header"><label class="select-all-label"><input type="checkbox" id="pan115-select-all" aria-label="全选 115 当前目录" disabled><span>文件名称</span></label><span>大小</span></div>
+          <div class="file-area" id="pan115-file-area" tabindex="0" aria-label="115 文件列表"><div class="empty-state"><div class="empty-cloud" aria-hidden="true">☁</div><h4>连接你的 115 网盘</h4><p>登录后，即可浏览和选择文件</p><button class="button primary blue" data-action="account" data-side="pan115" type="button">连接 115</button></div></div>
+          <div class="drive-footer"><span id="pan115-summary">0 个项目</span><span id="pan115-selection">未选择文件</span></div>
+        </article>
+      </section>
+
+      <section class="tasks-panel" aria-labelledby="tasks-title"><div class="tasks-header"><div><h2 id="tasks-title">传输任务 <span id="task-count" class="count-badge">0</span></h2><span id="queue-description">完成的文件会自动清理本机缓存</span></div><div class="task-header-actions"><button class="button small" id="queue-toggle" type="button" disabled>暂停队列</button><button class="button text-button small" id="logs-button" type="button">查看日志 ↗</button></div></div><div id="task-list" class="task-list" aria-live="polite"><div class="tasks-empty"><span aria-hidden="true">⇄</span><div><strong>还没有传输任务</strong><p>在上方选择文件，再点击中间的方向按钮开始复制。</p></div></div></div></section>
+    </main>
+
+    <footer class="app-footer"><span><i class="privacy-dot"></i> 登录凭证保存在本机</span><span>传输期间请保持电脑开机联网 <span class="footer-divider">·</span> <span id="version-label">OpenList 本地服务</span></span></footer>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <dialog id="account-dialog" class="dialog account-dialog"><form id="credentials-form"><div class="dialog-header"><div><span class="eyebrow">连接网盘</span><h2 id="account-dialog-title">连接夸克网盘</h2></div><button class="dialog-close" type="button" data-close="account-dialog" aria-label="关闭">×</button></div><p class="dialog-description">优先使用扫码或网页登录。完成授权后，回到这里查看连接状态。</p><button class="button primary login-button" id="browser-login-button" type="button">打开扫码 / 网页登录 ↗</button><p id="login-message" class="form-status" role="status"></p><button id="manual-toggle" class="button text-button manual-toggle" type="button" aria-expanded="false" aria-controls="manual-credentials">使用手动凭证 <span aria-hidden="true">⌄</span></button><div id="manual-credentials" hidden><p class="field-hint">自动登录不可用时，可填写有效凭证。请不要将凭证分享给其他人。</p><label class="field"><span>Cookie <span class="field-optional" id="cookie-optional"></span></span><input type="password" id="cookie-input" autocomplete="off" spellcheck="false" placeholder="粘贴完整 Cookie"></label><div id="token-fields" hidden><label class="field"><span>Access Token</span><input type="password" id="access-token-input" autocomplete="off" spellcheck="false" placeholder="粘贴 Access Token"></label><label class="field"><span>Refresh Token</span><input type="password" id="refresh-token-input" autocomplete="off" spellcheck="false" placeholder="粘贴 Refresh Token"></label></div><p class="field-hint" id="credential-hint">保存后将验证连接，凭证不会显示在任务记录中。</p><div class="dialog-actions"><button class="button" type="button" data-close="account-dialog">取消</button><button class="button primary" id="save-credentials-button" type="submit">保存并连接</button></div></div></form></dialog>
+
+  <dialog id="copy-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">新建传输任务</span><h2 id="copy-dialog-title">确认复制</h2></div><button class="dialog-close" type="button" data-close="copy-dialog" aria-label="关闭">×</button></div><p class="dialog-description" id="copy-selection-description"></p><div class="copy-route"><div><span>从</span><strong id="copy-source"></strong></div><span class="route-arrow" aria-hidden="true">↓</span><div><span>到</span><strong id="copy-destination"></strong></div></div><ul class="copy-rules"><li>保留源文件；同名文件自动加序号，保留两份。</li><li>同名文件夹合并，包含的子目录将一并复制。</li><li>通过本机缓存中转，完成后核对目录、数量和字节大小。</li></ul><p id="copy-error" class="form-status error" role="alert"></p><div class="dialog-actions"><button class="button" type="button" data-close="copy-dialog">取消</button><button class="button primary" id="confirm-copy-button" type="button">开始复制</button></div></dialog>
+
+  <dialog id="settings-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">偏好设置</span><h2>本机缓存与数据</h2></div><button class="dialog-close" type="button" data-close="settings-dialog" aria-label="关闭">×</button></div><p class="dialog-description">文件逐个下载到缓存，再上传到目标网盘。上传并验证完成后，程序自动清理对应缓存。</p><label class="field"><span>缓存目录</span><div class="directory-picker"><input id="cache-dir" type="text" readonly aria-label="当前缓存目录" placeholder="正在读取…"><button id="choose-cache-button" class="button" type="button">选择目录</button></div></label><p class="field-hint">可选剩余空间较大的磁盘。开始下载前会检查空间，正在传输时请勿删除缓存。</p><div class="settings-note"><strong>中断后可以继续任务</strong><p>重新打开后保留任务记录，只重试未完成文件。单个中断文件可能需要从头传输。</p></div><div class="folder-actions"><button class="button small" data-open-folder="cache" type="button">打开缓存目录 ↗</button><button class="button small" data-open-folder="data" type="button">打开数据目录 ↗</button></div><div class="dialog-actions"><button class="button primary" data-close="settings-dialog" type="button">完成</button></div></dialog>
+
+  <dialog id="error-dialog" class="dialog"><div class="dialog-header"><div><span class="eyebrow">任务详情</span><h2 id="error-dialog-title">查看失败原因</h2></div><button class="dialog-close" type="button" data-close="error-dialog" aria-label="关闭">×</button></div><div id="error-details" class="error-details"></div><div class="dialog-actions"><button class="button primary" data-close="error-dialog" type="button">知道了</button></div></dialog>
+</body>
+</html>
+

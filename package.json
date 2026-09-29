@@ -1,0 +1,43 @@
+{
+  "name": "openlist-transfer",
+  "version": "1.0.0",
+  "description": "夸克与115网盘双向文件复制工具",
+  "main": "src/main.js",
+  "author": "OpenList Transfer contributors",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "test": "node --test",
+    "prepare:engine": "node scripts/prepare-engine.js",
+    "prepare:runtime": "node scripts/prepare-runtime.js",
+    "build:win": "node scripts/build-win.js",
+    "archive:source": "node scripts/archive-source.js"
+  },
+  "devDependencies": {
+    "electron": "44.4.5",
+    "electron-builder": "26.17.0"
+  },
+  "build": {
+    "appId": "org.openlist.transfer",
+    "productName": "OpenList Transfer",
+    "asar": true,
+    "directories": { "output": "release", "buildResources": "build" },
+    "electronDist": "node_modules/electron/dist",
+    "files": ["src/**/*", "!src/**/qa-preview.png", "package.json", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+    "extraResources": [
+      { "from": "vendor/openlist.exe", "to": "engine/openlist.exe" },
+      { "from": "vendor/manifest.json", "to": "engine/manifest.json" },
+      { "from": "vendor/licenses", "to": "licenses" },
+      { "from": "vendor/source", "to": "source" },
+      { "from": "README.md", "to": "README.md" }
+    ],
+    "win": {
+      "target": [{ "target": "portable", "arch": ["x64"] }],
+      "artifactName": "OpenListTransfer-${version}-${arch}.${ext}",
+      "signAndEditExecutable": false
+    },
+    "portable": { "requestExecutionLevel": "user" }
+  }
+}
