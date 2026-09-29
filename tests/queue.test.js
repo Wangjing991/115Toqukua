@@ -176,3 +176,56 @@ test('corrupt persistent records are preserved and never silently overwritten', 
   const { dir } = await fixture(t); const file = path.join(dir, 'broken.json'); await fs.writeFile(file, 'not json');
   assert.throws(() => new Store(file, { jobs: [] }), /无法读取/); assert.equal(await fs.readFile(file, 'utf8'), 'not json');
 });
+
+test('logging out preserves history but prevents cancelled tasks from retrying under a new account', async t => {
+  const { engine, queue, store, dir } = await fixture(t);
+  engine.addFile('/夸克/a', 'old account');
+  queue.pause();
+  const { id } = await queue.add({ side: 'quark', sourceDir: '/夸克', names: ['a'], targetDir: '/115' });
+  await waitFor(() => queue.jobs[0].status === 'paused');
+  assert.throws(() => queue.invalidateCancelledTasks('quark'), /完成或取消/);
+  await queue.cancel(id);
+  queue.jobs.push({ id: 'completed-history', status: 'completed', entries: [], directories: [] });
+  queue.invalidateCancelledTasks('pan115');
+  assert.equal(queue.jobs.length, 2);
+  assert.equal(queue.jobs[1].retryBlockedReason, undefined);
+  assert.match(queue.summaries()[0].retryBlockedReason, /账号已退出/);
+  await assert.rejects(queue.retry(id), /不能重试旧任务/);
+  const restored = new Queue({ engine, store: new Store(store.file, { jobs: [] }), cacheDir: dir });
+  await assert.rejects(restored.retry(id), /不能重试旧任务/);
+  assert.equal(engine.uploads.length, 0);
+  assert.equal(engine.files.get('/夸克/a').toString(), 'old account');
+});
+
+test('cancelled status still blocks logout while a recovered upload is being stopped', async t => {
+  const { engine, queue, dir } = await fixture(t);
+  queue.jobs.push({ id: 'recovering', status: 'paused', sourceDir: '/夸克', targetDir: '/115', cacheDir: dir,
+    entries: [{ id: 'file', taskId: 'old-upload', status: 'uploading', size: 5 }], directories: [] });
+  let finishCancel;
+  engine.cancelUploadTask = () => new Promise(resolve => { finishCancel = resolve; });
+  const cancelling = queue.cancel('recovering');
+  assert.equal(queue.jobs[0].status, 'cancelled');
+  assert.equal(queue.running, false);
+  assert.equal(queue.hasUnfinished(), true, 'cancellation cleanup must be included in the account guard');
+  await assert.rejects(queue.retry('recovering'), /处理或取消中/);
+  assert.throws(() => queue.invalidateCancelledTasks('quark'), /完成或取消/);
+  finishCancel(); await cancelling;
+  assert.equal(queue.hasUnfinished(), false);
+  assert.doesNotThrow(() => queue.invalidateCancelledTasks('quark'));
+});
+
+test('failed upload cancellation retains the task and blocks logout until cancellation succeeds', async t => {
+  const { engine, queue, dir } = await fixture(t);
+  queue.jobs.push({ id: 'recovering', status: 'paused', sourceDir: '/夸克', targetDir: '/115', cacheDir: dir,
+    entries: [{ id: 'file', taskId: 'old-upload', status: 'uploading', size: 5 }], directories: [] });
+  engine.cancelUploadTask = async () => { throw new Error('cancellation unavailable'); };
+  await assert.rejects(queue.cancel('recovering'), /cancellation unavailable/);
+  assert.equal(queue.jobs[0].status, 'failed');
+  assert.equal(queue.jobs[0].entries[0].taskId, 'old-upload');
+  assert.equal(queue.hasUnfinished(), true);
+  assert.throws(() => queue.invalidateCancelledTasks('pan115'), /完成或取消/);
+  engine.cancelUploadTask = async () => {};
+  await queue.cancel('recovering');
+  assert.equal(queue.jobs[0].entries[0].taskId, null);
+  assert.equal(queue.hasUnfinished(), false);
+});

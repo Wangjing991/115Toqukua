@@ -9,16 +9,18 @@ const { Queue } = require('./queue');
 const { Engine } = require('./engine');
 const { MOUNTS, within, redact } = require('./paths');
 const { parse115Callback } = require('./auth-tokens');
+const { AccountLifecycle } = require('./account-lifecycle');
 
 app.setName('OpenListTransfer');
 const profilePath = process.env.OPENLIST_TRANSFER_TEST_DATA ? path.resolve(process.env.OPENLIST_TRANSFER_TEST_DATA) : path.join(app.getPath('appData'), 'OpenListTransfer');
 fs.mkdirSync(profilePath, { recursive: true }); app.setPath('userData', profilePath);
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  let window, engine, queue, store, quitting = false, sleepBlocker;
+  let window, engine, queue, store, accounts, quitting = false, sleepBlocker;
   const appURL = pathToFileURL(path.join(__dirname, 'renderer', 'index.html')).href;
   const state = { engine: { status: 'starting', version: '4.2.6' }, accounts: { quark: { connected: false, mount: MOUNTS.quark }, pan115: { connected: false, mount: MOUNTS.pan115 } }, logs: [] };
   const authWindows = new Map();
+  let accountUpdate = 0;
   const snapshot = () => ({ ...state, settings: { cacheDir: store?.data.cacheDir || '' }, paused: queue?.paused || false, jobs: queue?.summaries() || [] });
   function broadcast() {
     if (window && !window.isDestroyed()) window.webContents.send('state', snapshot());
@@ -44,11 +46,13 @@ else {
   }
   function validateSide(side) { if (!Object.hasOwn(MOUNTS, side)) throw new Error('网盘类型无效'); return side; }
   async function updateAccounts() {
+    const revision = ++accountUpdate;
     const accounts = await engine.getAccounts();
+    if (revision !== accountUpdate) return;
     for (const side of Object.keys(MOUNTS)) state.accounts[side] = { ...accounts[side], mount: MOUNTS[side] };
     broadcast();
   }
-  async function saveCredentials(input) {
+  async function saveCredentials(input, revision) {
     ready(); const side = validateSide(input?.side);
     const credentials = { side };
     if (side === 'quark') {
@@ -60,15 +64,17 @@ else {
         credentials[key] = input[key].trim();
       }
     }
-    await engine.saveCredentials(credentials);
-    state.accounts[side].connected = false; state.accounts[side].message = '正在验证目录读取'; broadcast();
-    // Explicitly probe reading: a saved storage record alone does not establish connectivity.
-    try { await engine.list({ path: MOUNTS[side], refresh: true }); }
-    catch (error) { state.accounts[side].connected = false; state.accounts[side].message = redact(error); broadcast(); throw error; }
-    await updateAccounts();
-    state.accounts[side].connected = true; state.accounts[side].message = '已连接';
-    log(`${side === 'quark' ? '夸克' : '115'}连接成功`);
-    return { connected: true };
+    return accounts.save(side, async () => {
+      await engine.saveCredentials(credentials);
+      state.accounts[side].connected = false; state.accounts[side].message = '正在验证目录读取'; broadcast();
+      // Explicitly probe reading: a saved storage record alone does not establish connectivity.
+      try { await engine.list({ path: MOUNTS[side], refresh: true }); }
+      catch (error) { state.accounts[side].connected = false; state.accounts[side].message = redact(error); broadcast(); throw error; }
+      await updateAccounts();
+      state.accounts[side].connected = true; state.accounts[side].message = '已连接';
+      log(`${side === 'quark' ? '夸克' : '115'}连接成功`);
+      return { connected: true };
+    }, revision);
   }
   function allowedAuthURL(value, side) {
     try {
@@ -79,6 +85,7 @@ else {
   }
   async function login({ side }) {
     ready(); validateSide(side);
+    const revision = accounts.loginRevision(side);
     if (authWindows.has(side)) { authWindows.get(side).focus(); return { opened: true }; }
     const authSession = session.fromPartition('persist:openlist-login-' + side);
     authSession.setUserAgent(authSession.getUserAgent().replace(/(?:OpenListTransfer|Electron)\/[\w.]+\s*/g, ''));
@@ -132,34 +139,52 @@ else {
         }
         const fingerprint = createHash('sha256').update(JSON.stringify(credentials)).digest('hex');
         if (fingerprint === lastFingerprint) return;
-        await saveCredentials(credentials);
+        if (loginWindow.isDestroyed() || !accounts.isCurrent(side, revision)) return;
+        await saveCredentials(credentials, revision);
         lastFingerprint = fingerprint;
         if (!loginWindow.isDestroyed()) loginWindow.close();
       } catch (e) {
+        if (loginWindow.isDestroyed() || !accounts.isCurrent(side, revision)) return;
         retryAfter = Date.now() + 30000;
         state.accounts[side].message = '自动接入尚未成功，可完成网页登录后重试，或使用手动凭证入口'; broadcast();
       } finally { checking = false; }
     }
     timer = setInterval(probe, 3000);
-    loginWindow.on('closed', () => { clearInterval(timer); authWindows.delete(side); for (const child of childWindows) if (!child.isDestroyed()) child.close(); });
+    loginWindow.on('closed', () => { clearInterval(timer); authWindows.delete(side); for (const child of childWindows) if (!child.isDestroyed()) child.destroy(); });
     await loginWindow.loadURL(side === 'quark' ? 'https://pan.quark.cn' : 'https://api.oplist.org');
     return { opened: true };
   }
   handle('get-state', () => snapshot());
   handle('list', async input => { ready(); const side = validateSide(input?.side); return engine.list({ path: within(input.path, MOUNTS[side]), refresh: !!input.refresh }); });
   handle('login', login); handle('save-credentials', saveCredentials);
-  handle('start-transfer', async input => { ready(); return queue.add(input); });
+  handle('logout', async input => {
+    ready(); const side = validateSide(input?.side);
+    const revision = accounts.revisions[side];
+    try {
+      const result = await accounts.logout(side);
+      if (result.disconnected) log(`${side === 'quark' ? '夸克' : '115'}账号已退出`);
+      return result;
+    } finally {
+      // A rejected busy request or a dismissed dialog did not change credentials.
+      // Do not let either start an older status request that races a real logout.
+      if (!accounts.isCurrent(side, revision)) await updateAccounts();
+    }
+  });
+  handle('start-transfer', async input => { ready(); accounts.assertAvailable(); return queue.add(input); });
   handle('pause-queue', () => { ready(); return queue.pause(); });
-  handle('resume-queue', () => { ready(); return queue.resume(); });
-  handle('retry-job', id => { ready(); return queue.retry(id); });
+  handle('resume-queue', () => { ready(); accounts.assertAvailable(); return queue.resume(); });
+  handle('retry-job', id => { ready(); accounts.assertAvailable(); return queue.retry(id); });
   handle('cancel-job', id => { ready(); return queue.cancel(id); });
   handle('choose-cache', async () => {
-    ready(); if (queue.hasUnfinished()) throw new Error('请先完成或取消现有任务，再更换缓存目录');
+    ready(); accounts.assertAvailable(); if (queue.hasUnfinished()) throw new Error('请先完成或取消现有任务，再更换缓存目录');
     const result = await dialog.showOpenDialog(window, { title: '选择缓存所在文件夹', properties: ['openDirectory', 'createDirectory'], defaultPath: store.data.cacheDir });
     if (result.canceled) return { cacheDir: store.data.cacheDir };
-    const dir = path.join(result.filePaths[0], 'OpenListTransferCache');
-    fs.mkdirSync(dir, { recursive: true }); await engine.setCacheDir(dir);
-    store.data.cacheDir = dir; store.save(); queue.cacheDir = dir; broadcast(); return { cacheDir: dir };
+    return accounts.exclusive(async () => {
+      if (queue.running || queue.hasUnfinished()) throw new Error('请先完成或取消现有任务，再更换缓存目录');
+      const dir = path.join(result.filePaths[0], 'OpenListTransferCache');
+      fs.mkdirSync(dir, { recursive: true }); await engine.setCacheDir(dir);
+      store.data.cacheDir = dir; store.save(); queue.cacheDir = dir; broadcast(); return { cacheDir: dir };
+    });
   });
   handle('open-folder', async ({ kind }) => {
     const allowed = { data: app.getPath('userData'), logs: path.join(app.getPath('userData'), 'logs'), cache: store?.data.cacheDir };
@@ -191,6 +216,17 @@ else {
       await engine.start(); state.engine = { status: 'ready', version: '4.2.6' };
       queue = new Queue({ engine, store, cacheDir: store.data.cacheDir }); queue.on('change', broadcast);
       queue.on('fault', message => log('队列已暂停：' + message));
+      accounts = new AccountLifecycle({ engine, queue,
+        sessionFor: side => session.fromPartition('persist:openlist-login-' + side),
+        closeLogin: side => { const auth = authWindows.get(side); if (auth && !auth.isDestroyed()) auth.destroy(); },
+        confirmLogout: async side => {
+          const result = await dialog.showMessageBox(window, { type: 'question', title: '退出当前账号',
+            message: `确定退出${side === 'quark' ? '夸克' : '115'}账号？`,
+            detail: '将移除本软件保存的该账号凭证和网页登录状态。云端文件及另一侧账号保留。已取消的旧任务将无法重试，请重新选择文件创建任务。此操作不会撤销网盘网站上的应用授权。',
+            buttons: ['取消', '退出账号'], defaultId: 0, cancelId: 0 });
+          return result.response === 1;
+        },
+      });
       await updateAccounts(); log('本地引擎已就绪，服务仅监听本机');
     } catch (e) { state.engine = { status: 'error', version: '4.2.6', error: redact(e) }; log('启动失败：' + redact(e)); }
     broadcast();

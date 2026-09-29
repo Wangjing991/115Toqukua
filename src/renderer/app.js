@@ -11,6 +11,9 @@
     snapshot: { engine: { status: 'starting' }, accounts: {}, settings: {}, paused: false, jobs: [] },
     panes: Object.fromEntries(sides.map(side => [side, { path: '', entries: [], selected: new Set(), loaded: false, loading: false, error: '', request: 0 }])),
     accountSide: 'quark',
+    accountRevision: { quark: 0, pan115: 0 },
+    logoutPending: new Set(),
+    authPending: new Set(),
     pendingCopy: null,
     jobsSignature: '',
     toastTimer: null,
@@ -326,9 +329,9 @@
       meta.append(node('span', '', summary), stageNode);
       content.append(titleRow, path, track, meta);
       const actions = node('div', 'task-actions');
-      if (job.status === 'failed' || job.status === 'cancelled' || failed > 0) actions.append(jobButton('重试', () => runJobAction('retryJob', job.id)));
-      if (job.status === 'failed' || failed > 0 || job.errors?.length) actions.append(jobButton('查看原因', () => showJobDetails(job.id)));
-      if (!terminalStates.has(job.status)) actions.append(jobButton('取消', () => runJobAction('cancelJob', job.id), 'danger'));
+      if (!job.retryBlockedReason && (job.status === 'failed' || job.status === 'cancelled' || failed > 0)) actions.append(jobButton('重试', () => runJobAction('retryJob', job.id)));
+      if (job.retryBlockedReason || job.status === 'failed' || failed > 0 || job.errors?.length) actions.append(jobButton('查看原因', () => showJobDetails(job.id)));
+      if (job.status === 'failed' || !terminalStates.has(job.status)) actions.append(jobButton('取消', () => runJobAction('cancelJob', job.id), 'danger'));
       item.append(direction, content, actions);
       fragment.append(item);
     }
@@ -355,9 +358,20 @@
     if (!job) return;
     byId('error-dialog-title').textContent = statusLabels[job.status] || '任务详情';
     const errors = Array.isArray(job.errors) ? job.errors.map(error => typeof error === 'string' ? error : error?.message || JSON.stringify(error)) : [];
-    const details = [...new Set([job.message, ...errors].filter(Boolean))];
+    const details = [...new Set([job.retryBlockedReason, job.message, ...errors].filter(Boolean))];
     byId('error-details').textContent = details.length ? details.join('\n\n') : '当前未记录详细错误。请打开日志目录查看传输日志。';
     byId('error-dialog').showModal();
+  }
+
+  function resetPane(side) {
+    const pane = model.panes[side];
+    ++pane.request;
+    Object.assign(pane, { entries: [], selected: new Set(), loaded: false, loading: false, error: '', path: rootPath(side) });
+    if (model.pendingCopy) {
+      model.pendingCopy = null;
+      byId('copy-dialog').close();
+    }
+    paintPane(side);
   }
 
   function acceptState(snapshot) {
@@ -372,9 +386,7 @@
       const info = account(side);
       const prior = previous.accounts?.[side] || {};
       if (!info.connected && prior.connected) {
-        ++pane.request;
-        Object.assign(pane, { entries: [], selected: new Set(), loaded: false, loading: false, error: '', path: rootPath(side) });
-        paintPane(side);
+        resetPane(side);
       } else if (info.connected && ready() && (!prior.connected || previous.engine?.status !== 'ready' || prior.mount !== info.mount)) {
         loadDirectory(side, prior.mount === info.mount && pane.path ? pane.path : rootPath(side), true);
       } else if (!info.connected) {
@@ -385,6 +397,7 @@
       }
     }
     paintJobs();
+    paintAccountControls();
     updateCopyButtons();
     const newlyCompleted = (snapshot.jobs || []).filter(job => job.status === 'completed' && previousJobs.has(job.id) && previousJobs.get(job.id) !== 'completed');
     for (const side of sides) {
@@ -404,10 +417,20 @@
     ['cookie-input', 'access-token-input', 'refresh-token-input'].forEach(id => { byId(id).value = ''; });
   }
 
+  function paintAccountControls() {
+    const pending = model.logoutPending.has(model.accountSide);
+    const authPending = model.authPending.has(model.accountSide);
+    byId('logout-button').disabled = !ready() || pending;
+    byId('logout-button').textContent = pending ? '正在退出…' : '退出当前账号';
+    byId('logout-button').setAttribute('aria-busy', String(pending));
+    byId('browser-login-button').disabled = !ready() || pending || authPending;
+    byId('save-credentials-button').disabled = !ready() || pending || authPending;
+  }
+
   function openAccount(side) {
     model.accountSide = side;
     clearCredentials();
-    byId('account-dialog-title').textContent = `连接${labels[side]}网盘`;
+    byId('account-dialog-title').textContent = `${account(side).connected ? '管理' : '连接'}${labels[side]}网盘`;
     byId('manual-credentials').hidden = true;
     byId('manual-toggle').setAttribute('aria-expanded', 'false');
     byId('token-fields').hidden = side !== 'pan115';
@@ -416,31 +439,72 @@
     const status = byId('login-message');
     status.classList.remove('error');
     status.textContent = account(side).connected ? '当前账号已连接。重新授权或保存凭证将更新该网盘的连接。' : '';
-    byId('browser-login-button').disabled = !ready();
-    byId('save-credentials-button').disabled = !ready();
+    paintAccountControls();
     byId('account-dialog').showModal();
   }
 
-  async function browserLogin() {
-    const button = byId('browser-login-button');
-    const status = byId('login-message');
+  async function logoutAccount() {
     const side = model.accountSide;
+    if (model.logoutPending.has(side) || !ready()) return;
+    const status = byId('login-message');
+    model.logoutPending.add(side);
+    // Credential validation can briefly report disconnected. Only an explicit
+    // logout supersedes an in-flight login/save response, including partial
+    // logout failures whose browser session or credentials were already cleared.
+    ++model.accountRevision[side];
+    paintAccountControls();
     status.classList.remove('error');
-    status.textContent = '正在打开登录页面，请按页面提示完成授权…';
-    button.disabled = true;
+    status.textContent = '请在确认窗口中选择是否退出当前账号。';
     try {
-      const result = await call('login', { side });
-      if (model.accountSide === side) status.textContent = result?.message || '已打开登录入口。完成后将自动更新连接状态；也可使用下方手动凭证。';
+      const result = await call('logout', { side });
+      if (result?.cancelled) {
+        if (model.accountSide === side) status.textContent = '已取消退出，账号状态未改变。';
+        return;
+      }
+      if (!result?.disconnected) throw new Error('退出结果未确认，请刷新账号状态后重试。');
+      resetPane(side);
+      if (model.accountSide === side) clearCredentials();
       await refreshState();
-      if (model.accountSide === side && account(side).connected) { status.textContent = '连接成功，可以关闭此窗口并浏览文件。'; }
+      if (model.accountSide === side) {
+        byId('account-dialog-title').textContent = `连接${labels[side]}网盘`;
+        status.textContent = '已退出当前账号，可重新登录。';
+      }
+      toast(`已退出${labels[side]}账号。`);
     } catch (error) {
       if (model.accountSide === side) { status.classList.add('error'); status.textContent = errorMessage(error); }
-    } finally { button.disabled = !ready(); }
+      else toast(errorMessage(error), true);
+    } finally {
+      model.logoutPending.delete(side);
+      paintAccountControls();
+    }
+  }
+
+  async function browserLogin() {
+    const status = byId('login-message');
+    const side = model.accountSide;
+    if (model.logoutPending.has(side) || model.authPending.has(side)) return;
+    const revision = model.accountRevision[side];
+    model.authPending.add(side);
+    status.classList.remove('error');
+    status.textContent = '正在打开登录页面，请按页面提示完成授权…';
+    paintAccountControls();
+    try {
+      const result = await call('login', { side });
+      if (revision !== model.accountRevision[side]) return;
+      if (model.accountSide === side) status.textContent = result?.message || '已打开登录入口。完成后将自动更新连接状态；也可使用下方手动凭证。';
+      await refreshState();
+      if (revision !== model.accountRevision[side]) return;
+      if (model.accountSide === side && account(side).connected) { status.textContent = '连接成功，可以关闭此窗口并浏览文件。'; }
+    } catch (error) {
+      if (model.accountSide === side && revision === model.accountRevision[side]) { status.classList.add('error'); status.textContent = errorMessage(error); }
+    } finally { model.authPending.delete(side); paintAccountControls(); }
   }
 
   async function saveCredentials(event) {
     event.preventDefault();
     const side = model.accountSide;
+    if (model.logoutPending.has(side) || model.authPending.has(side)) return;
+    const revision = model.accountRevision[side];
     const cookie = byId('cookie-input').value.trim();
     const accessToken = byId('access-token-input').value.trim();
     const refreshToken = byId('refresh-token-input').value.trim();
@@ -451,20 +515,22 @@
       status.textContent = side === 'quark' ? '请先粘贴夸克 Cookie。' : '请同时填写 115 Open Access Token 和 Refresh Token。';
       return;
     }
-    const button = byId('save-credentials-button');
-    button.disabled = true;
+    model.authPending.add(side);
+    paintAccountControls();
     status.textContent = '正在保存并检查连接…';
     try {
       await call('saveCredentials', side === 'quark' ? { side, cookie } : { side, accessToken, refreshToken });
-      clearCredentials();
+      if (revision !== model.accountRevision[side]) return;
+      if (model.accountSide === side) clearCredentials();
       await refreshState();
+      if (revision !== model.accountRevision[side]) return;
       if (model.accountSide === side) {
         if (account(side).connected) { byId('account-dialog').close(); toast(`${labels[side]}网盘已连接。`); }
         else status.textContent = '凭证已保存，正在等待连接结果。';
       }
     } catch (error) {
-      if (model.accountSide === side) { status.classList.add('error'); status.textContent = errorMessage(error); }
-    } finally { button.disabled = !ready(); }
+      if (model.accountSide === side && revision === model.accountRevision[side]) { status.classList.add('error'); status.textContent = errorMessage(error); }
+    } finally { model.authPending.delete(side); paintAccountControls(); }
   }
 
   function prepareCopy(side) {
@@ -523,6 +589,7 @@
       if (!panel.hidden) byId(model.accountSide === 'quark' ? 'cookie-input' : 'access-token-input').focus();
     });
     byId('browser-login-button').addEventListener('click', browserLogin);
+    byId('logout-button').addEventListener('click', logoutAccount);
     byId('credentials-form').addEventListener('submit', saveCredentials);
     byId('copy-to-115').addEventListener('click', () => prepareCopy('quark'));
     byId('copy-to-quark').addEventListener('click', () => prepareCopy('pan115'));

@@ -491,6 +491,29 @@ class Engine extends EventEmitter {
     return this.getAccounts();
   }
 
+  async removeAccount(side) {
+    if (!Object.hasOwn(ACCOUNTS, side)) throw failure('不支持的账号类型。', 'INVALID_ARGUMENT');
+    if (this.status !== 'ready') throw failure('本机引擎尚未就绪。', 'NOT_READY');
+    const account = ACCOUNTS[side];
+    const matches = (await this._listStorages()).filter((item) => item.mount_path === account.mount);
+    if (matches.some((item) => item.driver !== account.driver)) {
+      throw failure('账号挂载路径被其它驱动占用，未删除配置。', 'MOUNT_CONFLICT');
+    }
+    if (matches.length > 1) throw failure('账号挂载配置重复，未删除配置。', 'INVALID_RESPONSE');
+    const storage = matches[0];
+    if (storage) {
+      if (!Number.isSafeInteger(storage.id) || storage.id <= 0) throw failure('账号配置编号无效，未删除配置。', 'INVALID_RESPONSE');
+      // OpenList's admin storage deletion drops the local mount and credential
+      // record. It never uses the filesystem remove endpoint or deletes files.
+      await this._request('POST', `/admin/storage/delete?id=${storage.id}`);
+      const remaining = await this._listStorages();
+      if (remaining.some((item) => item.id === storage.id || item.mount_path === account.mount)) {
+        throw failure('账号配置仍然存在，请重试退出账号。', 'ACCOUNT_NOT_REMOVED');
+      }
+    }
+    return this.getAccounts();
+  }
+
   async list({ path: requestedPath, refresh = false }) {
     const directory = virtualPath(requestedPath);
     const entries = [];

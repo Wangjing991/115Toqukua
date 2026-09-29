@@ -6,6 +6,7 @@
 - 面包屑、上一级和刷新均只作用于对应网盘。服务器状态推送不会重置选择；同目录刷新只移除已经不存在的选中项。
 - 复制前展示实际来源和目标目录，并解释保留源文件、同名文件序号、文件夹合并以及本机中转。
 - 账号弹窗优先调用扫码或网页登录；手动凭证仅支持夸克 Cookie 和 115 Open 的 Access/Refresh Token，115 两个令牌都必须填写。输入框使用 password 类型，关闭弹窗或保存成功后清空。
+- 账号弹窗提供“退出当前账号”，尚未连接时也可清理残留登录。主进程确认并清理选定账号的本地配置与独立浏览器会话，保留另一侧状态。退出前须完成或取消全部未完成任务；取消收尾也计入保护。已取消旧任务在账号退出后不可重试，历史仍可查看。
 - 任务区显示整批已完成文件/字节进度、当前阶段、失败原因及重试/取消。暂停和继续控制整条队列，暂停提示明确当前阶段结束后停止。空目录、未连接、读取失败、服务启动及服务错误都有专门状态。
 - 缓存目录选择由主进程显示原生目录选择器。可以打开缓存、数据及日志目录。
 - 页面不使用框架、外部字体或网络资源。严格 CSP 禁用内联脚本、对象、表单提交；所有外部文件名、路径和错误通过 `textContent` 写入 DOM，没有 `innerHTML`。
@@ -14,7 +15,9 @@
 
 ## 预载 API 约定
 
-`getState()`、`list({side,path,refresh})`、`login({side})`、`saveCredentials({side,cookie?,accessToken?,refreshToken?})`、`chooseCache()`、`startTransfer({side,sourceDir,names,targetDir})`、`pauseQueue()`、`resumeQueue()`、`cancelJob(id)`、`retryJob(id)`、`openFolder({kind})`、`onState(callback)`。
+`getState()`、`list({side,path,refresh})`、`login({side})`、`saveCredentials({side,cookie?,accessToken?,refreshToken?})`、`logout({side})`、`chooseCache()`、`startTransfer({side,sourceDir,names,targetDir})`、`pauseQueue()`、`resumeQueue()`、`cancelJob(id)`、`retryJob(id)`、`openFolder({kind})`、`onState(callback)`。
+
+`logout` 返回 `{disconnected:true}` 或确认取消时的 `{cancelled:true}`；操作失败抛错。退出中禁用重复提交，成功后清空该侧路径、列表、选择和输入，忽略旧目录请求和登录回调。任务摘要的 `retryBlockedReason` 禁止旧账号任务重试，失败任务保留“取消”入口。
 
 `stageProgress` 约定为 0–100 的阶段百分比。状态事件中的 `jobs` 按创建先后排序，界面从最新任务开始显示。账号错误信息可通过 `accounts[side].message` 提供。只有后端将任务标记为 `completed`，界面才展示“目录、数量和大小已核对”。
 

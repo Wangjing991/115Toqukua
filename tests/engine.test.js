@@ -173,6 +173,95 @@ test('listing returns every page and refreshes only the first request', async (t
   assert.equal(result.entries[0].isDir, true);
 });
 
+test('logout deletes only the selected exact account configuration and is idempotent', async (t) => {
+  let storages = [
+    { id: 1, mount_path: '/夸克', driver: 'Quark', status: 'work', addition: '{"cookie":"test-quark-cookie"}' },
+    { id: 2, mount_path: '/115', driver: '115 Open', status: 'work', addition: '{"access_token":"test-115-token"}' },
+    { id: 3, mount_path: '/_cache', driver: 'Local', status: 'work', addition: '{"root_folder_path":"test-cache"}' },
+    { id: 4, mount_path: '/other-quark', driver: 'Quark', status: 'work', addition: '{"cookie":"test-other-cookie"}' },
+  ];
+  const others = structuredClone(storages.slice(1));
+  const deleted = [];
+  const { engine, directory } = await mockEngine(t, (req, body) => {
+    if (req.url.startsWith('/api/admin/storage/list')) return success({ content: storages, total: storages.length });
+    assert.equal(req.method, 'POST');
+    assert.equal(req.url, '/api/admin/storage/delete?id=1');
+    assert.equal(body.length, 0);
+    deleted.push(1);
+    storages = storages.filter((item) => item.id !== 1);
+    return success(null);
+  });
+  const cachedFile = path.join(directory, 'retained-cache.bin');
+  await fsp.writeFile(cachedFile, 'unfinished file cache');
+  const accounts = await engine.removeAccount('quark');
+  assert.equal(accounts.quark.connected, false);
+  assert.equal(accounts.pan115.connected, true);
+  assert.deepEqual(storages, others);
+  assert.deepEqual(await engine.removeAccount('quark'), accounts);
+  assert.deepEqual(deleted, [1]);
+  assert.equal(await fsp.readFile(cachedFile, 'utf8'), 'unfinished file cache');
+  assert.doesNotMatch(JSON.stringify(accounts), /test-quark-cookie|test-115-token|test-other-cookie/);
+});
+
+test('logout removes expired 115 configuration even when it is not connected', async (t) => {
+  let storages = [{ id: 17, mount_path: '/115', driver: '115 Open', disabled: true, status: 'token expired' }];
+  const { engine } = await mockEngine(t, (req) => {
+    if (req.url.startsWith('/api/admin/storage/list')) return success({ content: storages, total: storages.length });
+    assert.equal(req.url, '/api/admin/storage/delete?id=17');
+    storages = [];
+    return success(null);
+  });
+  assert.equal((await engine.getAccounts()).pan115.connected, false);
+  assert.equal((await engine.removeAccount('pan115')).pan115.connected, false);
+  assert.deepEqual(storages, []);
+});
+
+test('logout rejects a different driver at the account mount and invalid account names', async (t) => {
+  let requests = 0;
+  const { engine } = await mockEngine(t, (req) => {
+    requests += 1;
+    assert.ok(req.url.startsWith('/api/admin/storage/list'));
+    return success({ content: [{ id: 4, mount_path: '/夸克', driver: 'Local' }], total: 1 });
+  });
+  await assert.rejects(engine.removeAccount('quark'), { code: 'MOUNT_CONFLICT' });
+  for (const side of ['unknown', '__proto__', null, undefined]) {
+    await assert.rejects(engine.removeAccount(side), { code: 'INVALID_ARGUMENT' });
+  }
+  assert.equal(requests, 1);
+  engine.status = 'starting';
+  await assert.rejects(engine.removeAccount('pan115'), { code: 'NOT_READY' });
+  assert.equal(requests, 1);
+});
+
+test('logout does not report success for API errors or a configuration that remains', async (t) => {
+  const storage = { id: 8, mount_path: '/115', driver: '115 Open', status: 'work' };
+  let deleteAttempts = 0;
+  const { engine } = await mockEngine(t, (req) => {
+    if (req.url.startsWith('/api/admin/storage/list')) return success({ content: [storage], total: 1 });
+    assert.equal(req.url, '/api/admin/storage/delete?id=8');
+    deleteAttempts += 1;
+    return deleteAttempts === 1 ? { code: 500, message: 'failed delete storage in database' } : success(null);
+  });
+  await assert.rejects(engine.removeAccount('pan115'), { code: 'API_ERROR' });
+  assert.equal((await engine.getAccounts()).pan115.connected, true);
+  await assert.rejects(engine.removeAccount('pan115'), { code: 'ACCOUNT_NOT_REMOVED' });
+  assert.equal(deleteAttempts, 2);
+});
+
+test('logout refuses ambiguous or invalid storage identifiers without deleting anything', async (t) => {
+  let storages = [{ id: '8&other=9', mount_path: '/115', driver: '115 Open' }];
+  const { engine } = await mockEngine(t, (req) => {
+    assert.ok(req.url.startsWith('/api/admin/storage/list'));
+    return success({ content: storages, total: storages.length });
+  });
+  await assert.rejects(engine.removeAccount('pan115'), { code: 'INVALID_RESPONSE' });
+  storages = [
+    { id: 8, mount_path: '/115', driver: '115 Open' },
+    { id: 9, mount_path: '/115', driver: '115 Open' },
+  ];
+  await assert.rejects(engine.removeAccount('pan115'), { code: 'INVALID_RESPONSE' });
+});
+
 test('task cancellation and retry send tid as a query parameter', async (t) => {
   const seen = [];
   const { engine } = await mockEngine(t, (req) => {
@@ -255,6 +344,56 @@ test('Windows watchdog closes its exact child when the owning Node process is ki
 });
 
 const integrationBinary = process.env.OPENLIST_TEST_BINARY;
+test('real v4.2.6 logout persists after restart and preserves other mounts and cached files', {
+  skip: !integrationBinary || !fs.existsSync(integrationBinary), timeout: 120000,
+}, async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'openlist-logout-integration-'));
+  const cacheDir = path.join(directory, 'cache');
+  const otherDir = path.join(directory, 'other');
+  const engine = new Engine({ binaryPath: integrationBinary, dataDir: path.join(directory, 'data'), cacheDir });
+  t.after(async () => {
+    await engine.stop();
+    await removeFixture(directory, 'openlist-logout-integration-');
+  });
+  await fsp.mkdir(otherDir);
+  await fsp.writeFile(path.join(otherDir, 'keep.txt'), 'other storage file');
+  await engine.start();
+  await fsp.writeFile(path.join(cacheDir, 'unfinished.bin'), 'retained cache');
+  await engine._upsertStorage({
+    mount_path: '/other-local', driver: 'Local', disabled: false,
+    addition: JSON.stringify({ root_folder_path: otherDir, show_hidden: true }),
+  });
+  for (const [mount, driver] of [['/夸克', 'Quark'], ['/115', '115 Open']]) {
+    // v4.2.6 persists the storage before parsing addition. Malformed JSON
+    // prevents driver.Init (and therefore all cloud requests) from running.
+    // Disabled also prevents either fixture from loading on an engine restart.
+    await assert.rejects(engine._request('POST', '/admin/storage/create', {
+      mount_path: mount, driver, disabled: true, addition: '{',
+    }), { code: 'API_ERROR' });
+  }
+  const before = await engine._listStorages();
+  assert.ok(before.some((item) => item.mount_path === '/夸克' && item.driver === 'Quark'));
+  assert.ok(before.some((item) => item.mount_path === '/115' && item.driver === '115 Open'));
+  const protectedMounts = before.filter((item) => ['/_cache', '/other-local'].includes(item.mount_path));
+  await engine.removeAccount('quark');
+  const afterQuark = await engine._listStorages();
+  assert.equal(afterQuark.some((item) => item.mount_path === '/夸克'), false);
+  assert.ok(afterQuark.some((item) => item.mount_path === '/115'));
+  assert.deepEqual(afterQuark.filter((item) => ['/_cache', '/other-local'].includes(item.mount_path)), protectedMounts);
+  await engine.removeAccount('pan115');
+  await engine.stop();
+  await engine.start();
+  const afterRestart = await engine._listStorages();
+  assert.deepEqual(afterRestart.map((item) => item.mount_path).sort(), ['/_cache', '/other-local']);
+  assert.equal((await engine.getAccounts()).quark.connected, false);
+  assert.equal((await engine.getAccounts()).pan115.connected, false);
+  await engine.removeAccount('quark');
+  await engine.removeAccount('pan115');
+  assert.equal(await fsp.readFile(path.join(cacheDir, 'unfinished.bin'), 'utf8'), 'retained cache');
+  assert.equal(await fsp.readFile(path.join(otherDir, 'keep.txt'), 'utf8'), 'other storage file');
+  assert.equal((await engine.list({ path: '/other-local', refresh: true })).entries[0].name, 'keep.txt');
+});
+
 test('real v4.2.6 starts privately, copies and uploads local bytes, rejects conflicts, and restarts', {
   skip: !integrationBinary || !fs.existsSync(integrationBinary), timeout: 180000,
 }, async (t) => {

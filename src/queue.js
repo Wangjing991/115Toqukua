@@ -10,7 +10,7 @@ class Queue extends EventEmitter {
   constructor({ engine, store, cacheDir, downloader = download, pollMs = 1000 }) {
     super(); this.engine = engine; this.store = store; this.cacheDir = cacheDir; this.downloader = downloader; this.pollMs = pollMs;
     this.jobs = store.data.jobs || []; this.paused = this.jobs.some(j => !['completed', 'cancelled'].includes(j.status));
-    this.running = false; this.current = null; this.lastEmit = 0;
+    this.running = false; this.current = null; this.lastEmit = 0; this.pendingCleanups = 0;
     for (const j of this.jobs) {
       if (['running', 'queued', 'scanning'].includes(j.status)) j.status = 'paused';
       for (const e of j.entries || []) {
@@ -28,7 +28,7 @@ class Queue extends EventEmitter {
     return { id: j.id, sourcePath: j.sourceDir, targetPath: j.targetDir, status: j.status, totalFiles: entries.length,
       doneFiles: done.length, failedFiles: failures.length, totalBytes: entries.reduce((s, e) => s + e.size, 0), completedBytes: done.reduce((s, e) => s + e.size, 0),
       stage: j.stage, stageProgress: j.stageProgress || 0, message: [j.message, j.cacheWarning].filter(Boolean).join('；'), errors: [j.error, j.cacheWarning, ...failures.map(e => `${e.sourcePath}：${e.error}`)].filter(Boolean),
-      totalDirectories: (j.directories || []).length };
+      totalDirectories: (j.directories || []).length, retryBlockedReason: j.retryBlockedReason || '' };
   }); }
   async add({ side, sourceDir, names, targetDir }) {
     if (!MOUNTS[side]) throw new Error('请选择来源网盘');
@@ -217,6 +217,8 @@ class Queue extends EventEmitter {
   }
   async retry(id) {
     const job = this.jobs.find(j => j.id === id); if (!job) throw new Error('任务不存在');
+    if (this.pendingCleanups || this.current?.id === id) throw new Error('任务仍在处理或取消中，请稍后重试');
+    if (job.retryBlockedReason) throw new Error(job.retryBlockedReason);
     if (!['failed', 'cancelled', 'paused'].includes(job.status)) throw new Error('当前任务尚不能重试');
     job.cancelRequested = false; job.error = '';
     if (!job.planned) await this.plan(job);
@@ -227,12 +229,28 @@ class Queue extends EventEmitter {
     const job = this.jobs.find(j => j.id === id); if (!job || ['completed', 'cancelled'].includes(job.status)) return;
     job.cancelRequested = true;
     if (this.current?.id === id) { this.abort?.abort(); job.message = '正在取消当前文件'; }
-    else { job.status = 'cancelled'; await this.cleanJob(job); }
+    else {
+      this.pendingCleanups++;
+      try {
+        job.status = 'cancelled'; await this.cleanJob(job);
+        job.error = ''; job.message = '已取消；已完成的目标文件予以保留';
+      }
+      catch (error) {
+        job.status = 'failed'; job.error = '取消未完成：' + redact(error);
+        job.message = '未能确认上传已停止，请查看原因并再次取消';
+        throw error;
+      }
+      finally { this.pendingCleanups--; this.changed(); }
+    }
     this.changed();
   }
   async cleanJob(job) {
     for (const e of job.entries) {
-      if (e.taskId && e.status !== 'completed') { await this.engine.cancelUploadTask(e.taskId).catch(() => {}); e.taskId = null; }
+      if (e.taskId && e.status !== 'completed') {
+        try { await this.engine.cancelUploadTask(e.taskId); }
+        catch (error) { if (error.code !== 'NOT_FOUND') throw error; }
+        e.taskId = null;
+      }
       const file = localWithin(job.cacheDir, job.id, e.id, 'content.bin');
       await fs.promises.rm(file, { force: true }).catch(() => {});
       await fs.promises.rm(file + '.part', { force: true }).catch(() => {});
@@ -241,7 +259,16 @@ class Queue extends EventEmitter {
     }
     await fs.promises.rmdir(localWithin(job.cacheDir, job.id)).catch(() => {});
   }
-  hasUnfinished() { return this.jobs.some(j => !['completed', 'cancelled'].includes(j.status)); }
+  invalidateCancelledTasks(side) {
+    if (!MOUNTS[side]) throw new Error('网盘类型无效');
+    if (this.running || this.hasUnfinished()) throw new Error('请先完成或取消现有任务');
+    for (const job of this.jobs) if (job.status === 'cancelled') {
+      job.retryBlockedReason = '该任务使用的账号已退出，不能重试旧任务；请重新选择文件创建任务。';
+      job.error = job.retryBlockedReason;
+    }
+    this.changed();
+  }
+  hasUnfinished() { return this.pendingCleanups > 0 || this.jobs.some(j => !['completed', 'cancelled'].includes(j.status)); }
   async stop() {
     this.pause(); this.abort?.abort();
     let timeout;
