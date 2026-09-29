@@ -9,7 +9,7 @@
   const terminalStates = new Set(['completed', 'failed', 'cancelled']);
   const model = {
     snapshot: { engine: { status: 'starting' }, accounts: {}, settings: {}, paused: false, jobs: [] },
-    panes: Object.fromEntries(sides.map(side => [side, { path: '', entries: [], selected: new Set(), loaded: false, loading: false, error: '', request: 0 }])),
+    panes: Object.fromEntries(sides.map(side => [side, { path: '', entries: [], selected: new Set(), loaded: false, loading: false, loadingMore: false, error: '', pageError: '', page: 0, total: 0, hasMore: false, request: 0 }])),
     accountSide: 'quark',
     accountRevision: { quark: 0, pan115: 0 },
     logoutPending: new Set(),
@@ -35,7 +35,12 @@
   const rootPath = side => account(side).mount || (side === 'quark' ? '/夸克' : '/115');
   const trimPath = path => String(path || '/').replace(/\/+$/, '') || '/';
   const joinPath = (base, name) => `${trimPath(base) === '/' ? '' : trimPath(base)}/${name}`;
-  const errorMessage = error => error?.message || String(error || '操作未完成，请稍后重试。');
+  const errorMessage = error => {
+    let message = error?.message || String(error || '操作未完成，请稍后重试。');
+    message = message.replace(/^(?:Error:\s*)?Error invoking remote method '[^']+':\s*(?:Error:\s*)?/i, '');
+    message = message.replace(/^Error:\s*/i, '');
+    return message || '操作未完成，请稍后重试。';
+  };
 
   function bytes(value) {
     const size = number(value);
@@ -94,6 +99,8 @@
     byId('version-label').textContent = engine.version ? `OpenList ${engine.version}` : 'OpenList 本地服务';
     byId('cache-dir').value = model.snapshot.settings?.cacheDir || '';
     byId('choose-cache-button').disabled = !ready() || hasUnfinishedTasks();
+    byId('refresh-all-button').disabled = !ready() || !sides.some(side => account(side).connected);
+    byId('quit-app-button').disabled = !api || maintenanceBusy();
     document.querySelectorAll('[data-action="account"]').forEach(button => { button.disabled = !ready(); });
   }
 
@@ -135,7 +142,7 @@
     }
     crumbs.replaceChildren(elements);
     crumbs.scrollLeft = crumbs.scrollWidth;
-    const canBrowse = ready() && account(side).connected && !pane.loading;
+    const canBrowse = ready() && account(side).connected && !pane.loading && !pane.loadingMore;
     document.querySelector(`[data-action="up"][data-side="${side}"]`).disabled = !canBrowse || path === mount;
     document.querySelector(`[data-action="refresh"][data-side="${side}"]`).disabled = !canBrowse;
   }
@@ -158,7 +165,7 @@
   function paintPane(side) {
     const pane = model.panes[side];
     const area = byId(`${side}-file-area`);
-    area.setAttribute('aria-busy', String(pane.loading));
+    area.setAttribute('aria-busy', String(pane.loading || pane.loadingMore));
     paintPath(side);
     if (!account(side).connected) {
       area.replaceChildren(emptyState(side, { title: `连接你的${labels[side]}网盘`, description: account(side).message || '登录后，即可浏览和选择文件', actionLabel: `连接${labels[side]}`, action: () => openAccount(side) }));
@@ -204,9 +211,22 @@
         });
         fragment.append(row);
       }
+      if (pane.hasMore || pane.loadingMore || pane.pageError) {
+        const more = node('div', 'lazy-load');
+        if (pane.pageError) more.append(node('span', 'lazy-load-error', pane.pageError));
+        const button = node('button', `button small${side === 'pan115' ? ' primary blue' : ''}`, pane.loadingMore ? '正在加载…' : pane.pageError ? '重试加载' : '加载更多');
+        button.type = 'button';
+        button.setAttribute('aria-label', `${pane.pageError ? '重试加载' : '加载更多'}${labels[side]}文件`);
+        button.disabled = pane.loadingMore || !ready();
+        button.addEventListener('click', () => loadMore(side));
+        more.append(button);
+        fragment.append(more);
+      }
       area.replaceChildren(fragment);
     }
-    byId(`${side}-summary`).textContent = pane.loading ? '正在读取…' : `${pane.entries.length.toLocaleString('zh-CN')} 个项目`;
+    byId(`${side}-summary`).textContent = pane.loading ? '正在读取…' : pane.total > pane.entries.length
+      ? `已加载 ${pane.entries.length.toLocaleString('zh-CN')} / ${pane.total.toLocaleString('zh-CN')} 项`
+      : `${pane.entries.length.toLocaleString('zh-CN')} 个项目`;
     updateSelection(side);
   }
 
@@ -252,11 +272,16 @@
     const request = ++pane.request;
     pane.path = nextPath;
     pane.loading = true;
+    pane.loadingMore = false;
     pane.error = '';
-    if (changed) { pane.selected.clear(); pane.entries = []; }
+    pane.pageError = '';
+    pane.page = 0;
+    pane.total = 0;
+    pane.hasMore = false;
+    if (changed || refresh) { pane.selected.clear(); pane.entries = []; }
     paintPane(side);
     try {
-      const result = await call('list', { side, path: nextPath, refresh });
+      const result = await call('list', { side, path: nextPath, refresh, page: 1 });
       if (request !== pane.request) return;
       pane.entries = (Array.isArray(result?.entries) ? result.entries : [])
         .filter(entry => typeof entry.name === 'string' && entry.name !== '.' && entry.name !== '..' && !entry.name.includes('/'))
@@ -264,6 +289,9 @@
       const available = new Set(pane.entries.map(entry => entry.name));
       pane.selected = new Set([...pane.selected].filter(name => available.has(name)));
       pane.loaded = true;
+      pane.page = 1;
+      pane.total = Math.max(pane.entries.length, Number(result?.total) || 0);
+      pane.hasMore = Boolean(result?.hasMore);
       pane.error = '';
     } catch (error) {
       if (request !== pane.request) return;
@@ -271,6 +299,36 @@
       pane.loaded = false;
     } finally {
       if (request === pane.request) { pane.loading = false; paintPane(side); }
+    }
+  }
+
+  async function loadMore(side) {
+    const pane = model.panes[side];
+    if (!ready() || !account(side).connected || pane.loading || pane.loadingMore || !pane.hasMore) return;
+    const area = byId(`${side}-file-area`);
+    const scrollTop = area.scrollTop;
+    const request = pane.request;
+    const nextPage = pane.page + 1;
+    pane.loadingMore = true;
+    pane.pageError = '';
+    paintPane(side);
+    area.scrollTop = scrollTop;
+    try {
+      const result = await call('list', { side, path: pane.path, refresh: false, page: nextPage });
+      if (request !== pane.request) return;
+      const incoming = (Array.isArray(result?.entries) ? result.entries : [])
+        .filter(entry => typeof entry.name === 'string' && entry.name !== '.' && entry.name !== '..' && !entry.name.includes('/'));
+      const byName = new Map(pane.entries.map(entry => [entry.name, entry]));
+      for (const entry of incoming) byName.set(entry.name, entry);
+      pane.entries = [...byName.values()].sort((a, b) => Number(Boolean(b.is_dir)) - Number(Boolean(a.is_dir)) || a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+      pane.page = nextPage;
+      pane.total = Math.max(pane.entries.length, Number(result?.total) || pane.total);
+      pane.hasMore = Boolean(result?.hasMore);
+    } catch (error) {
+      if (request !== pane.request) return;
+      pane.pageError = errorMessage(error);
+    } finally {
+      if (request === pane.request) { pane.loadingMore = false; paintPane(side); area.scrollTop = scrollTop; }
     }
   }
 
@@ -376,7 +434,7 @@
   function resetPane(side) {
     const pane = model.panes[side];
     ++pane.request;
-    Object.assign(pane, { entries: [], selected: new Set(), loaded: false, loading: false, error: '', path: rootPath(side) });
+    Object.assign(pane, { entries: [], selected: new Set(), loaded: false, loading: false, loadingMore: false, error: '', pageError: '', page: 0, total: 0, hasMore: false, path: rootPath(side) });
     if (model.pendingCopy) {
       model.pendingCopy = null;
       byId('copy-dialog').close();
@@ -652,12 +710,28 @@
       loadDirectory(side, path.slice(0, path.lastIndexOf('/')) || rootPath(side));
     }));
     document.querySelectorAll('[data-action="refresh"]').forEach(button => button.addEventListener('click', () => loadDirectory(button.dataset.side, model.panes[button.dataset.side].path, true)));
+    byId('refresh-all-button').addEventListener('click', () => {
+      for (const side of sides) if (account(side).connected) loadDirectory(side, model.panes[side].path, true);
+    });
+    byId('quit-app-button').addEventListener('click', async () => {
+      if (!api || maintenanceBusy()) return;
+      const button = byId('quit-app-button');
+      button.disabled = true;
+      try {
+        const result = await call('quitApp');
+        if (result?.closing === false) button.disabled = false;
+      } catch (error) { button.disabled = false; toast(errorMessage(error), true); }
+    });
     for (const side of sides) {
       byId(`${side}-select-all`).addEventListener('change', event => {
         if (!ready()) return;
         const pane = model.panes[side];
         pane.selected = event.target.checked ? new Set(pane.entries.map(entry => entry.name)) : new Set();
         updateSelection(side);
+      });
+      byId(`${side}-file-area`).addEventListener('scroll', event => {
+        const area = event.currentTarget;
+        if (area.scrollHeight - area.scrollTop - area.clientHeight < 90) loadMore(side);
       });
     }
     document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => byId(button.dataset.close).close()));

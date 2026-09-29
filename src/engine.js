@@ -538,15 +538,31 @@ class Engine extends EventEmitter {
     return this.getAccounts();
   }
 
+  async listPage({ path: requestedPath, refresh = false, page = 1, perPage = 200 }) {
+    const directory = virtualPath(requestedPath);
+    const pageNumber = Number(page);
+    const pageSize = Number(perPage);
+    if (!Number.isSafeInteger(pageNumber) || pageNumber < 1) throw failure('目录页码无效。', 'INVALID_ARGUMENT');
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 500) throw failure('目录分页大小无效。', 'INVALID_ARGUMENT');
+    const data = await this._request('POST', '/fs/list', {
+      path: directory, password: '', refresh: !!refresh && pageNumber === 1, page: pageNumber, per_page: pageSize,
+    }, { timeout: DIRECTORY_LIST_TIMEOUT });
+    if (!data || (data.content !== null && !Array.isArray(data.content))) throw failure('文件列表响应无效。', 'INVALID_RESPONSE');
+    const content = data.content || [];
+    const entries = content.map((item) => ({ ...item, isDir: !!item.is_dir, path: path.posix.join(directory, item.name) }));
+    const total = Number.isSafeInteger(Number(data.total)) && Number(data.total) >= 0 ? Number(data.total) : entries.length;
+    const loadedThrough = (pageNumber - 1) * pageSize + entries.length;
+    const hasMore = content.length > 0 && loadedThrough < total;
+    return { path: directory, entries, total, hasMore, nextPage: hasMore ? pageNumber + 1 : null };
+  }
+
   async list({ path: requestedPath, refresh = false }) {
     const directory = virtualPath(requestedPath);
     const entries = [];
     for (let page = 1; ; page += 1) {
-      const data = await this._request('POST', '/fs/list', { path: directory, password: '', refresh: !!refresh && page === 1, page, per_page: 500 }, { timeout: DIRECTORY_LIST_TIMEOUT });
-      if (!data || (data.content !== null && !Array.isArray(data.content))) throw failure('文件列表响应无效。', 'INVALID_RESPONSE');
-      const content = data.content || [];
-      entries.push(...content.map((item) => ({ ...item, isDir: !!item.is_dir, path: path.posix.join(directory, item.name) })));
-      if (entries.length >= data.total || !content.length) return { path: directory, entries };
+      const result = await this.listPage({ path: directory, refresh: !!refresh && page === 1, page, perPage: 500 });
+      entries.push(...result.entries);
+      if (entries.length >= result.total || !result.entries.length) return { path: directory, entries };
     }
   }
 

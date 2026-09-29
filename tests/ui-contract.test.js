@@ -130,6 +130,54 @@ test('desktop renderer preserves selection, respects credential types and sends 
   } finally { await browser.close(); }
 });
 
+test('directory browser lazily appends pages, shows the direct 115 error and exposes refresh and close controls', { skip: !playwright && !process.env.UI_TEST_PLAYWRIGHT }, async () => {
+  if (!playwright) throw moduleError;
+  const browser = await playwright.chromium.launch({ headless: true, ...(process.env.UI_TEST_CHROMIUM ? { executablePath: process.env.UI_TEST_CHROMIUM } : {}) });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1200, height: 850 } });
+    await context.addInitScript(() => {
+      const snapshot = {
+        engine: { status: 'ready', version: 'pagination-fixture' },
+        accounts: { quark: { connected: true, mount: '/夸克' }, pan115: { connected: true, mount: '/115' } },
+        settings: {}, paused: false, jobs: [],
+      };
+      const fixture = window.__uiTest = { calls: [], pan115Error: true };
+      window.bridge = {
+        async getState() { return structuredClone(snapshot); },
+        async list(args) {
+          fixture.calls.push({ method: 'list', args });
+          if (args.side === 'pan115' && fixture.pan115Error) {
+            throw new Error("Error invoking remote method 'list': Error: 115 Open: 当前目录访问频率过高");
+          }
+          if (args.side === 'quark' && args.page === 2) return { path: '/夸克', entries: [{ name: '第三项.txt', size: 3 }], total: 3, hasMore: false };
+          if (args.side === 'quark') return { path: '/夸克', entries: [{ name: '第一项.txt', size: 1 }, { name: '第二项.txt', size: 2 }], total: 3, hasMore: true, nextPage: 2 };
+          return { path: '/115', entries: [], total: 0, hasMore: false };
+        },
+        async quitApp() { fixture.calls.push({ method: 'quitApp' }); },
+        onState() { return () => {}; },
+      };
+    });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(pathToFileURL(path.resolve(__dirname, '../src/renderer/index.html')).href);
+    await page.getByText('115 Open: 当前目录访问频率过高', { exact: true }).waitFor();
+    assert.equal(await page.getByText(/Error invoking remote method/, { exact: false }).count(), 0, 'Electron IPC wrapper must not leak into the page');
+    assert.equal(await page.getByText('第三项.txt', { exact: true }).count(), 0, 'only the first page is fetched initially');
+    await page.getByRole('button', { name: '加载更多夸克文件', exact: true }).click();
+    await page.getByText('第三项.txt', { exact: true }).waitFor();
+    const quarkCalls = await page.evaluate(() => window.__uiTest.calls.filter(call => call.method === 'list' && call.args.side === 'quark'));
+    assert.deepEqual(quarkCalls.map(call => call.args.page), [1, 2]);
+    await page.evaluate(() => { window.__uiTest.pan115Error = false; });
+    await page.getByRole('button', { name: '刷新文件列表', exact: true }).click();
+    await page.waitForFunction(() => window.__uiTest.calls.some(call => call.method === 'list' && call.args.side === 'pan115' && call.args.refresh === true));
+    await page.getByRole('button', { name: '关闭程序', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.__uiTest.calls.some(call => call.method === 'quitApp')), true);
+    assert.deepEqual(errors, []);
+    await context.close();
+  } finally { await browser.close(); }
+});
+
 test('logout handles cancellation, errors, stale requests and account-bound retry actions in the real DOM', { skip: !playwright && !process.env.UI_TEST_PLAYWRIGHT }, async () => {
   if (!playwright) throw moduleError;
   const browser = await playwright.chromium.launch({ headless: true, ...(process.env.UI_TEST_CHROMIUM ? { executablePath: process.env.UI_TEST_CHROMIUM } : {}) });

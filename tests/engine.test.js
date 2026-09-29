@@ -236,6 +236,25 @@ test('listing returns every page and refreshes only the first request', async (t
   assert.equal(result.entries[0].isDir, true);
 });
 
+test('interactive directory browsing returns one bounded page with continuation metadata', async (t) => {
+  let calls = 0;
+  const { engine } = await mockEngine(t, (req, body) => {
+    calls += 1;
+    assert.equal(req.url, '/api/fs/list');
+    assert.deepEqual(JSON.parse(body), { path: '/115', password: '', refresh: true, page: 1, per_page: 200 });
+    return success({ total: 3, content: [
+      { name: '第一项', is_dir: true, size: 0 },
+      { name: '第二项.txt', is_dir: false, size: 12 },
+    ] });
+  });
+  const result = await engine.listPage({ path: '/115', refresh: true, page: 1, perPage: 200 });
+  assert.equal(calls, 1, 'opening a directory must not read every remote page');
+  assert.equal(result.entries.length, 2);
+  assert.equal(result.total, 3);
+  assert.equal(result.hasMore, true);
+  assert.equal(result.nextPage, 2);
+});
+
 test('large cloud directories receive a dedicated three-minute listing budget', async () => {
   const engine = new Engine({ binaryPath: 'unused.exe', dataDir: '.', cacheDir: '.' });
   engine._request = async (_method, endpoint, _body, options) => {

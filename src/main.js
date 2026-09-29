@@ -190,7 +190,22 @@ else {
     return { opened: true };
   }
   handle('get-state', () => snapshot());
-  handle('list', async input => { ready(); const side = validateSide(input?.side); return engine.list({ path: within(input.path, MOUNTS[side]), refresh: !!input.refresh }); });
+  handle('list', async input => {
+    ready();
+    const side = validateSide(input?.side);
+    return engine.listPage({ path: within(input.path, MOUNTS[side]), refresh: !!input.refresh, page: Number(input?.page) || 1, perPage: 200 });
+  });
+  handle('quit-app', () => {
+    maintenance.assertAvailable();
+    if (quitting) return { closing: true };
+    if (queue?.running) {
+      const result = dialog.showMessageBoxSync(window, { type: 'question', buttons: ['继续运行', '保存任务并退出'], defaultId: 0, cancelId: 0,
+        title: '传输尚未结束', message: '退出后传输将停止。任务记录会保留，单个未完成文件可能需要重新传输。' });
+      if (result === 0) return { closing: false };
+    }
+    app.quit();
+    return { closing: true };
+  });
   handle('login', login); handle('save-credentials', saveCredentials);
   handle('logout', async input => {
     ready(); const side = validateSide(input?.side);
@@ -327,8 +342,14 @@ else {
     if (maintenance.busy) { event.preventDefault(); return; }
     if (quitting) return; event.preventDefault(); quitting = true;
     // A late engine.start completion must not recreate work after shutdown stopped it.
-    Promise.resolve().then(async () => { await startup?.catch(() => {}); await queue?.stop(); for (const w of authWindows.values()) if (!w.isDestroyed()) w.destroy(); await engine?.stop(); })
-      .catch(() => {}).finally(() => { if (sleepBlocker !== undefined) powerSaveBlocker.stop(sleepBlocker); app.quit(); });
+    let shutdownTimer;
+    const cleanup = Promise.resolve().then(async () => { await startup?.catch(() => {}); await queue?.stop(); for (const w of authWindows.values()) if (!w.isDestroyed()) w.destroy(); await engine?.stop(); });
+    const deadline = new Promise(resolve => { shutdownTimer = setTimeout(resolve, 12000); });
+    Promise.race([cleanup, deadline]).catch(() => {}).finally(() => {
+      if (shutdownTimer !== undefined) clearTimeout(shutdownTimer);
+      if (sleepBlocker !== undefined) powerSaveBlocker.stop(sleepBlocker);
+      app.exit(0);
+    });
   });
   app.on('window-all-closed', () => { if (!quitting) app.quit(); });
 }

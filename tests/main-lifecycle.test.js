@@ -24,6 +24,7 @@ function fixture(options = {}) {
     requestSingleInstanceLock: () => true,
     whenReady: () => ready,
     quit: () => calls.push('quit'),
+    exit: code => calls.push(`exit:${code}`),
   });
   class FakeWindow extends EventEmitter {
     constructor(options) {
@@ -129,6 +130,16 @@ test('repeated launches restore and focus the one live main window', async () =>
   assert.equal(f.windows.length, 1);
   assert.equal(f.calls.filter(call => call === 'restore').length, 1);
   assert.equal(f.calls.filter(call => call === 'focus').length, 3);
+});
+
+test('the explicit close command starts shutdown and finishes with a process exit', async () => {
+  const f = fixture(); await f.ready();
+  await f.invoke('quit-app');
+  assert.equal(f.calls.includes('quit'), true);
+  f.app.emit('before-quit', { preventDefault() {} });
+  await f.flush();
+  assert.equal(f.calls.includes('engine.stop'), true);
+  assert.equal(f.calls.includes('exit:0'), true);
 });
 
 test('launch after the main window is destroyed does not call destroyed native methods', async () => {
