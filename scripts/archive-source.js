@@ -11,7 +11,7 @@ async function main() {
   const stage = await fs.mkdtemp(path.join(root, '.cache', 'source-stage-'));
   // Explicit allowlist: never walk user data, credentials, caches, dependencies or builds.
   const entries = ['package.json', 'package-lock.json', '.gitignore', 'README.md', 'LICENSE',
-    'THIRD_PARTY_NOTICES.md', 'scripts', 'src', 'tests', 'docs', 'vendor/manifest.json', 'vendor/licenses', 'vendor/source'];
+    'THIRD_PARTY_NOTICES.md', 'scripts', 'src', 'tests', 'docs', 'output/pdf', 'vendor/manifest.json', 'vendor/licenses', 'vendor/source'];
   for (const item of entries) {
     const from = path.join(root, item);
     if (!await fs.stat(from).catch(() => null)) continue;
