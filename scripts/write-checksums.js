@@ -4,7 +4,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 async function writeChecksums() {
   const output = path.resolve(__dirname, '..', 'release');
-  const names = ['OpenListTransfer-1.0.0-x64.exe', 'OpenListTransfer-1.0.0-source.zip'];
+  const version = require('../package.json').version;
+  const names = [`OpenListTransfer-${version}-x64.exe`, `OpenListTransfer-${version}-source.zip`];
   const lines = [];
   for (const name of names) {
     const bytes = await fs.readFile(path.join(output, name)).catch(() => null);

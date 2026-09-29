@@ -7,6 +7,7 @@ The small Markdown subset intentionally rejects unsupported block markup.
 """
 
 import os
+import json
 import re
 from html import escape
 from pathlib import Path
@@ -22,6 +23,7 @@ from reportlab.platypus import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
 SOURCE = ROOT / "docs" / "user-guide.md"
 OUTPUT = ROOT / "output" / "pdf" / "OpenListTransfer-使用指南.pdf"
 INK = colors.HexColor("#203047")
@@ -166,7 +168,7 @@ def page_frame(canvas, doc):
     canvas.setFont("Guide", 8)
     canvas.setFillColor(MUTED)
     canvas.drawString(42, A4[1] - 25, "双向云桥  /  OpenList Transfer")
-    canvas.drawRightString(A4[0] - 42, A4[1] - 25, "使用指南  ·  1.0.0")
+    canvas.drawRightString(A4[0] - 42, A4[1] - 25, f"使用指南  ·  {VERSION}")
     canvas.line(42, 34, A4[0] - 42, 34)
     canvas.setFont("Guide", 7.5)
     canvas.drawString(42, 22, "夸克与 115 双向复制  ·  保留源文件")

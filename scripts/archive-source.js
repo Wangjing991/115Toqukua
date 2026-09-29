@@ -4,6 +4,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
+const version = require('../package.json').version;
+const archiveName = `OpenListTransfer-${version}-source`;
 const quote = value => "'" + value.replace(/'/g, "''") + "'";
 
 async function main() {
@@ -15,13 +17,13 @@ async function main() {
   for (const item of entries) {
     const from = path.join(root, item);
     if (!await fs.stat(from).catch(() => null)) continue;
-    const to = path.join(stage, 'OpenListTransfer-1.0.0-source', item);
+    const to = path.join(stage, archiveName, item);
     await fs.mkdir(path.dirname(to), { recursive: true });
     await fs.cp(from, to, { recursive: true, filter: source => !/\.(db|log|writing)$/.test(source) && !/[\\/](credentials[^\\/]*|tasks\.json|settings\.json|qa-preview\.png)$/i.test(source) });
   }
-  const output = path.join(root, 'release', 'OpenListTransfer-1.0.0-source.zip');
+  const output = path.join(root, 'release', archiveName + '.zip');
   await fs.mkdir(path.dirname(output), { recursive: true });
-  const command = `Compress-Archive -LiteralPath ${quote(path.join(stage, 'OpenListTransfer-1.0.0-source'))} -DestinationPath ${quote(output)} -Force`;
+  const command = `Compress-Archive -LiteralPath ${quote(path.join(stage, archiveName))} -DestinationPath ${quote(output)} -Force`;
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, stdio: 'inherit' });
   if (result.status !== 0) throw new Error('Source archive creation failed.');
   const bytes = await fs.readFile(output);

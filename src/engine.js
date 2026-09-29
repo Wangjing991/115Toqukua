@@ -11,6 +11,8 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 
 const VERSION = '4.2.6';
+const DIRECTORY_LIST_TIMEOUT = 180000;
+const PAN115_LIST_PAGE_SIZE = 1150;
 const ACCOUNTS = Object.freeze({
   quark: { driver: 'Quark', mount: '/夸克' },
   pan115: { driver: '115 Open', mount: '/115' },
@@ -173,6 +175,10 @@ class Engine extends EventEmitter {
       }
       if (!ready) throw failure('本机引擎未能启动，请检查端口、引擎文件和数据目录。', 'START_FAILED');
       await this._mountCache();
+      // Migrate only while startup still excludes account/transfer operations.
+      // A status lookup must never restore credentials deleted by logout.
+      try { await this._upgrade115ListPage(await this._listStorages()); }
+      catch { /* A compatibility migration failure must not block normal login. */ }
       this._setStatus('ready');
       return { status: 'ready', version: VERSION, baseUrl: this.baseUrl };
     } catch (error) {
@@ -462,6 +468,24 @@ class Engine extends EventEmitter {
     });
   }
 
+  async _upgrade115ListPage(storages) {
+    const matches = storages.filter((item) => item.mount_path === ACCOUNTS.pan115.mount);
+    if (matches.length !== 1) return;
+    const storage = matches[0];
+    if (storage.driver !== ACCOUNTS.pan115.driver || !Number.isSafeInteger(storage.id) || storage.id <= 0) return;
+    let addition;
+    try { addition = JSON.parse(storage.addition || '{}'); }
+    catch { return; }
+    if (!addition || typeof addition !== 'object' || Array.isArray(addition) || Number(addition.page_size) >= PAN115_LIST_PAGE_SIZE) return;
+    const { mount_details, ...saved } = storage;
+    // Update only this existing ID. Never recreate a vanished account, even if
+    // a caller supplies a stale snapshot. Preserve disabled and all other fields.
+    await this._request('POST', '/admin/storage/update', {
+      ...saved,
+      addition: JSON.stringify({ ...addition, page_size: PAN115_LIST_PAGE_SIZE }),
+    });
+  }
+
   async getAccounts() {
     const storages = this.status === 'ready' ? await this._listStorages() : [];
     return Object.fromEntries(Object.entries(ACCOUNTS).map(([side, account]) => {
@@ -482,7 +506,7 @@ class Engine extends EventEmitter {
     fields.forEach((item) => this._secrets.add(item.trim()));
     const addition = side === 'quark'
       ? { root_folder_id: '0', cookie: cookie.trim(), order_by: 'none', order_direction: 'asc', use_transcoding_address: false, only_list_video_file: false }
-      : { root_folder_id: '0', access_token: accessToken.trim(), refresh_token: refreshToken.trim(), limit_rate: 1, page_size: 200, order_by: 'file_name', order_direction: 'asc' };
+      : { root_folder_id: '0', access_token: accessToken.trim(), refresh_token: refreshToken.trim(), limit_rate: 1, page_size: PAN115_LIST_PAGE_SIZE, order_by: 'file_name', order_direction: 'asc' };
     await this._upsertStorage({
       mount_path: account.mount, driver: account.driver, addition: JSON.stringify(addition),
       disabled: false, disable_index: true, enable_sign: true, web_proxy: true,
@@ -518,7 +542,7 @@ class Engine extends EventEmitter {
     const directory = virtualPath(requestedPath);
     const entries = [];
     for (let page = 1; ; page += 1) {
-      const data = await this._request('POST', '/fs/list', { path: directory, password: '', refresh: !!refresh && page === 1, page, per_page: 500 });
+      const data = await this._request('POST', '/fs/list', { path: directory, password: '', refresh: !!refresh && page === 1, page, per_page: 500 }, { timeout: DIRECTORY_LIST_TIMEOUT });
       if (!data || (data.content !== null && !Array.isArray(data.content))) throw failure('文件列表响应无效。', 'INVALID_RESPONSE');
       const content = data.content || [];
       entries.push(...content.map((item) => ({ ...item, isDir: !!item.is_dir, path: path.posix.join(directory, item.name) })));

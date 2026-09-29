@@ -1,6 +1,6 @@
 {
   "name": "openlist-transfer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "夸克与115网盘双向文件复制工具",
   "main": "src/main.js",
   "author": "OpenList Transfer contributors",
@@ -9,7 +9,7 @@
   "engines": { "node": ">=22.12.0" },
   "scripts": {
     "dev": "node scripts/dev.js",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "prepare:engine": "node scripts/prepare-engine.js",
     "prepare:runtime": "node scripts/prepare-runtime.js",
     "build:win": "node scripts/build-win.js",

@@ -40,6 +40,21 @@ async function waitFor(predicate, message = '等待任务完成') {
   while (!predicate()) { if (Date.now() > deadline) throw new Error(message); await new Promise(resolve => setTimeout(resolve, 5)); }
 }
 
+test('a retired queue cannot recreate reset history when cancelled directory scanning settles late', async t => {
+  const { engine, queue, store } = await fixture(t);
+  let release;
+  engine.list = () => new Promise(resolve => { release = resolve; });
+  const { id } = await queue.add({ side: 'quark', sourceDir: '/夸克', names: ['late'], targetDir: '/115' });
+  await queue.cancel(id);
+  queue.retire();
+  await fs.unlink(store.file);
+  release({ entries: [{ name: 'late', is_dir: false, size: 0 }] });
+  await new Promise(resolve => setImmediate(resolve));
+  await queue.stop();
+  assert.equal(queue.running, false);
+  await assert.rejects(fs.access(store.file), { code: 'ENOENT' });
+});
+
 test('copies a recursive tree, merges existing folders, preserves conflicts and checks bytes', async t => {
   const { engine, queue, dir } = await fixture(t);
   engine.addDir('/夸克/照片'); engine.addDir('/夸克/照片/空目录'); engine.addDir('/夸克/照片/子目录');

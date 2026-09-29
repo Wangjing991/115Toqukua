@@ -8,9 +8,12 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
 const { Engine } = require('../src/engine');
 const { Queue } = require('../src/queue');
 const { Store } = require('../src/store');
+const { AccountLifecycle } = require('../src/account-lifecycle');
+const { MaintenanceLifecycle } = require('../src/maintenance-lifecycle');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitUntil(predicate, timeout = 15000) {
@@ -153,10 +156,70 @@ test('account configuration uses exact driver names, string additions, and local
   assert.equal(stored[1].driver, '115 Open');
   assert.equal(JSON.parse(stored[0].addition).root_folder_id, '0');
   assert.equal(JSON.parse(stored[1].addition).refresh_token, 'REFRESH-VALUE');
+  assert.equal(JSON.parse(stored[1].addition).page_size, 1150, '115 should use the largest supported page to minimize remote requests');
   assert.doesNotMatch(JSON.stringify(accounts), /COOKIE-VALUE|ACCESS-VALUE|REFRESH-VALUE/);
   await engine.saveCredentials({ side: 'quark', cookie: 'NEW-COOKIE' });
   assert.equal(stored.length, 2);
   assert.equal(JSON.parse(stored[0].addition).cookie, 'NEW-COOKIE');
+});
+
+test('startup migration updates an existing legacy 115 ID without changing credentials or other properties', async (t) => {
+  let stored = [{
+    id: 7, mount_path: '/115', driver: '115 Open', status: 'work', disabled: false,
+    addition: JSON.stringify({ root_folder_id: '0', access_token: 'ACCESS-VALUE', refresh_token: 'REFRESH-VALUE', limit_rate: 1, page_size: 200 }),
+  }];
+  let updates = 0;
+  const { engine } = await mockEngine(t, (req, body) => {
+    if (req.url.startsWith('/api/admin/storage/list')) return success({ content: stored, total: stored.length });
+    assert.equal(req.url, '/api/admin/storage/update');
+    updates++;
+    assert.equal(JSON.parse(body).id, 7);
+    assert.equal(JSON.parse(body).disabled, false);
+    stored = [{ ...JSON.parse(body), status: 'work' }];
+    return success(null);
+  });
+  const accounts = await engine.getAccounts();
+  assert.equal(updates, 0, 'Account discovery must only read existing state');
+  assert.equal(JSON.parse(stored[0].addition).page_size, 200);
+  await engine._upgrade115ListPage(await engine._listStorages());
+  const addition = JSON.parse(stored[0].addition);
+  assert.equal(accounts.pan115.connected, true);
+  assert.equal(addition.page_size, 1150);
+  assert.equal(addition.limit_rate, 1);
+  assert.equal(addition.access_token, 'ACCESS-VALUE');
+  assert.equal(addition.refresh_token, 'REFRESH-VALUE');
+  await engine._upgrade115ListPage(await engine._listStorages());
+  assert.equal(updates, 1, 'Already migrated storage should not reinitialize');
+});
+
+test('a delayed account status response cannot recreate credentials after logout', async (t) => {
+  let stored = [{ id: 7, mount_path: '/115', driver: '115 Open', status: 'work',
+    addition: JSON.stringify({ access_token: 'fixture-only-token', page_size: 200 }) }];
+  let releaseSnapshot, snapshotStarted;
+  const captured = new Promise(resolve => { snapshotStarted = resolve; });
+  const delayed = new Promise(resolve => { releaseSnapshot = resolve; });
+  let first = true;
+  const writes = [];
+  const { engine } = await mockEngine(t, async (req, body) => {
+    if (req.url.startsWith('/api/admin/storage/list')) {
+      const content = structuredClone(stored);
+      if (first) { first = false; snapshotStarted(); await delayed; }
+      return success({ content, total: content.length });
+    }
+    writes.push(req.url);
+    if (req.url === '/api/admin/storage/delete?id=7') { stored = []; return success(null); }
+    if (req.url === '/api/admin/storage/create') { stored.push({ ...JSON.parse(body), id: 8 }); return success({ id: 8 }); }
+    throw new Error('Unexpected endpoint');
+  });
+  const pendingStatus = engine.getAccounts();
+  await captured;
+  try {
+    await engine.removeAccount('pan115');
+    assert.equal(stored.length, 0);
+  } finally { releaseSnapshot(); }
+  await pendingStatus;
+  assert.deepEqual(stored, [], 'An older read must never recreate the removed account');
+  assert.deepEqual(writes, ['/api/admin/storage/delete?id=7']);
 });
 
 test('listing returns every page and refreshes only the first request', async (t) => {
@@ -171,6 +234,22 @@ test('listing returns every page and refreshes only the first request', async (t
   assert.equal(result.entries.length, 2);
   assert.equal(result.entries[0].path, '/夸克/folder');
   assert.equal(result.entries[0].isDir, true);
+});
+
+test('large cloud directories receive a dedicated three-minute listing budget', async () => {
+  const engine = new Engine({ binaryPath: 'unused.exe', dataDir: '.', cacheDir: '.' });
+  engine._request = async (_method, endpoint, _body, options) => {
+    assert.equal(endpoint, '/fs/list');
+    const timeout = options?.timeout ?? 30000;
+    if (timeout < 180000) {
+      const error = new Error('本机引擎请求超时。');
+      error.code = 'TIMEOUT';
+      throw error;
+    }
+    return { total: 1, content: [{ name: '大型目录', is_dir: true, size: 0 }] };
+  };
+  const result = await engine.list({ path: '/115', refresh: true });
+  assert.equal(result.entries[0].name, '大型目录');
 });
 
 test('logout deletes only the selected exact account configuration and is idempotent', async (t) => {
@@ -344,6 +423,137 @@ test('Windows watchdog closes its exact child when the owning Node process is ki
 });
 
 const integrationBinary = process.env.OPENLIST_TEST_BINARY;
+test('real v4.2.6 migrates legacy 115 only before startup readiness and tolerates migration failure', {
+  skip: !integrationBinary || !fs.existsSync(integrationBinary), timeout: 120000,
+}, async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'openlist-migration-integration-'));
+  const engine = new Engine({ binaryPath: integrationBinary, dataDir: path.join(directory, 'engine'), cacheDir: path.join(directory, 'cache') });
+  t.after(async () => { await engine.stop(); await removeFixture(directory, 'openlist-migration-integration-'); });
+  const migrate = engine._upgrade115ListPage.bind(engine);
+  let attempts = 0, failMigration = false;
+  engine._upgrade115ListPage = async storages => {
+    assert.equal(engine.status, 'starting', 'Credential migration must finish before operations become available');
+    attempts++;
+    if (failMigration) throw new Error('fixture migration unavailable');
+    return migrate(storages);
+  };
+  await engine.start();
+  // First persist without driver.Init; a subsequent disabled update returns
+  // before driver initialization in OpenList, keeping all credentials offline.
+  await assert.rejects(engine._request('POST', '/admin/storage/create', {
+    mount_path: '/115', driver: '115 Open', disabled: true, addition: '{',
+  }), { code: 'API_ERROR' });
+  const old = (await engine._listStorages()).find(item => item.mount_path === '/115');
+  const addition = { root_folder_id: '0', access_token: 'fixture-only-access', refresh_token: 'fixture-only-refresh', limit_rate: 1, page_size: 200 };
+  const { mount_details, ...saved } = old;
+  await engine._request('POST', '/admin/storage/update', { ...saved, addition: JSON.stringify(addition) });
+  await engine.stop(); await engine.start();
+  assert.equal(engine.status, 'ready'); assert.equal(attempts, 2);
+  const upgraded = (await engine._listStorages()).find(item => item.mount_path === '/115');
+  assert.equal(upgraded.id, old.id); assert.equal(upgraded.disabled, true);
+  assert.deepEqual(JSON.parse(upgraded.addition), { ...addition, page_size: 1150 });
+  await engine.getAccounts(); await engine.getAccounts();
+  assert.equal(attempts, 2, 'Status refreshes must not migrate or reinitialize drivers');
+  await engine.stop(); failMigration = true; await engine.start();
+  assert.equal(attempts, 3); assert.equal(engine.status, 'ready', 'Migration failure must not prevent account management');
+  assert.equal((await engine.getAccounts()).pan115.connected, false);
+});
+
+test('real v4.2.6 cache cleanup preserves login records and history, then full reset reopens with fresh defaults', {
+  skip: !integrationBinary || !fs.existsSync(integrationBinary), timeout: 180000,
+}, async (t) => {
+  const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'openlist-maintenance-integration-'));
+  const profileDir = path.join(directory, 'profile');
+  const cacheDir = path.join(directory, 'custom-cache');
+  const defaultCacheDir = path.join(profileDir, 'cache');
+  const storePath = path.join(profileDir, 'tasks.json');
+  const engine = new Engine({ binaryPath: integrationBinary, dataDir: path.join(profileDir, 'engine'), cacheDir });
+  let freshEngine, queue;
+  t.after(async () => {
+    await queue?.stop();
+    await engine.stop();
+    await freshEngine?.stop();
+    await removeFixture(directory, 'openlist-maintenance-integration-');
+  });
+  const store = new Store(storePath, { version: 1, cacheDir, jobs: [] });
+  const jobId = randomUUID(), entryId = randomUUID();
+  store.data.jobs.push({ id: jobId, cacheDir, status: 'completed', side: 'quark',
+    sourceDir: '/夸克', targetDir: '/115', names: ['fixture.txt'], planned: true, directories: [],
+    entries: [{ id: entryId, name: 'fixture.txt', size: 4, status: 'completed', sourcePath: '/夸克/fixture.txt', targetDir: '/115', finalName: 'fixture.txt' }] });
+  queue = new Queue({ engine, store, cacheDir });
+  await fsp.mkdir(engine.dataDir, { recursive: true });
+  await fsp.writeFile(engine.configPath, JSON.stringify({ min_free_memory: -1 }));
+  await engine.start();
+  for (const [mount, driver, addition] of [
+    ['/夸克', 'Quark', '{"cookie":"test-only-never-used"'],
+    ['/115', '115 Open', '{"access_token":"test-only-never-used"'],
+  ]) {
+    // Malformed addition is persisted before parsing in v4.2.6 and prevents
+    // driver.Init from making a network request; disabled prevents restart init.
+    await assert.rejects(engine._request('POST', '/admin/storage/create', {
+      mount_path: mount, driver, disabled: true, addition,
+    }), { code: 'API_ERROR' });
+  }
+  // Match an already-opened profile: apply startup-only compatibility migration
+  // before taking the preservation baseline for this separate cleanup test.
+  await engine.stop(); await engine.start();
+  const beforeMounts = (await engine._listStorages()).filter(item => item.mount_path !== '/_cache');
+  assert.equal(beforeMounts.length, 2);
+  const beforeHistory = JSON.parse(await fsp.readFile(storePath, 'utf8'));
+  const knownCache = path.join(cacheDir, jobId, entryId, 'content.bin');
+  await fsp.mkdir(path.dirname(knownCache), { recursive: true });
+  await fsp.writeFile(knownCache, '1234');
+  await fsp.mkdir(path.join(defaultCacheDir, '.openlist-temp'), { recursive: true });
+  const tempCache = path.join(defaultCacheDir, '.openlist-temp', 'file-12345');
+  await fsp.writeFile(tempCache, '123');
+  const personal = path.join(cacheDir, 'keep-personal.txt');
+  await fsp.writeFile(personal, 'unrelated user content');
+  const calls = { quark: [], pan115: [] };
+  const sessions = Object.fromEntries(Object.keys(calls).map(side => [side, {
+    closeAllConnections: async () => calls[side].push('connections'),
+    clearStorageData: async () => calls[side].push('storage'),
+    clearCache: async () => calls[side].push('cache'),
+    clearAuthCache: async () => calls[side].push('auth'),
+    cookies: { flushStore: async () => calls[side].push('flush') },
+  }]));
+  const closed = [];
+  const sessionFor = side => sessions[side], closeLogin = side => closed.push(side);
+  const accounts = new AccountLifecycle({ engine, queue, sessionFor, closeLogin, confirmLogout: async () => true });
+  const maintenance = new MaintenanceLifecycle({ profileDir,
+    services: () => ({ engine, queue, store, accounts, starting: false }),
+    sessionFor, closeLogin, confirm: async () => true,
+  });
+
+  const cleared = await maintenance.run('clear-cache');
+  assert.equal(cleared.complete, true); assert.equal(cleared.files, 2); assert.equal(cleared.bytes, 7);
+  assert.equal(engine.status, 'ready');
+  assert.equal(fs.existsSync(knownCache), false); assert.equal(fs.existsSync(tempCache), false);
+  assert.equal(await fsp.readFile(personal, 'utf8'), 'unrelated user content');
+  assert.deepEqual((await engine._listStorages()).filter(item => item.mount_path !== '/_cache'), beforeMounts);
+  assert.deepEqual(JSON.parse(await fsp.readFile(storePath, 'utf8')), beforeHistory);
+  assert.equal(JSON.parse(await fsp.readFile(engine.configPath, 'utf8')).min_free_memory, -1);
+  assert.deepEqual(calls, { quark: [], pan115: [] }); assert.deepEqual(closed, []);
+
+  const reset = await maintenance.run('reset-app');
+  assert.equal(reset.reset, true); assert.equal(reset.complete, true); assert.equal(engine.status, 'stopped');
+  assert.equal(fs.existsSync(storePath), false);
+  assert.equal(fs.existsSync(path.join(engine.dataDir, 'data.db')), false);
+  assert.equal(fs.existsSync(engine.configPath), false);
+  for (const side of ['quark', 'pan115']) assert.deepEqual(calls[side], ['connections', 'storage', 'cache', 'auth', 'flush']);
+  assert.deepEqual(closed, ['quark', 'pan115']);
+  await queue.stop();
+  assert.equal(fs.existsSync(storePath), false, 'Retired queue must not restore deleted history on exit');
+  const freshStore = new Store(storePath, { version: 1, cacheDir: defaultCacheDir, jobs: [] });
+  assert.equal(freshStore.data.cacheDir, defaultCacheDir); assert.deepEqual(freshStore.data.jobs, []);
+  freshEngine = new Engine({ binaryPath: integrationBinary, dataDir: engine.dataDir, cacheDir: freshStore.data.cacheDir });
+  await freshEngine.start();
+  const freshAccounts = await freshEngine.getAccounts();
+  assert.equal(freshAccounts.quark.connected, false); assert.equal(freshAccounts.pan115.connected, false);
+  assert.deepEqual((await freshEngine._listStorages()).map(item => item.mount_path), ['/_cache']);
+  assert.equal(await fsp.readFile(personal, 'utf8'), 'unrelated user content');
+  assert.ok(fs.existsSync(cacheDir), 'Selected custom cache root must be preserved');
+});
+
 test('real v4.2.6 logout persists after restart and preserves other mounts and cached files', {
   skip: !integrationBinary || !fs.existsSync(integrationBinary), timeout: 120000,
 }, async (t) => {

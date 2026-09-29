@@ -65,6 +65,8 @@ test('desktop renderer preserves selection, respects credential types and sends 
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(pathToFileURL(path.resolve(__dirname, '../src/renderer/index.html')).href);
+    await page.waitForFunction(() => window.__uiTest.calls.filter(call => call.method === 'list').length >= 2);
+    assert.deepEqual(await page.evaluate(() => window.__uiTest.calls.filter(call => call.method === 'list').slice(0, 2).map(call => call.args.refresh)), [false, false], 'initial account paint should reuse the directory cache');
     await page.getByLabel('选择 笔记.txt', { exact: true }).check();
     await page.waitForFunction(() => document.getElementById('copy-to-115').disabled === false);
     assert.equal(await page.locator('#quark-file-area img').count(), 0, 'untrusted filename must remain text');
@@ -268,6 +270,156 @@ test('logout handles cancellation, errors, stale requests and account-bound retr
       { side: 'quark' }, { side: 'quark' }, { side: 'quark' }, { side: 'quark' }, { side: 'pan115' },
     ]);
     assert.deepEqual(pageErrors, []);
+    await context.close();
+  } finally { await browser.close(); }
+});
+
+test('maintenance preserves data when clearing cache, locks operations and confirms reset outcomes in the real DOM', { skip: !playwright && !process.env.UI_TEST_PLAYWRIGHT }, async () => {
+  if (!playwright) throw moduleError;
+  const browser = await playwright.chromium.launch({ headless: true, ...(process.env.UI_TEST_CHROMIUM ? { executablePath: process.env.UI_TEST_CHROMIUM } : {}) });
+  try {
+    const context = await browser.newContext({ viewport: { width: 1200, height: 850 } });
+    await context.addInitScript(() => {
+      const snapshot = {
+        engine: { status: 'ready', version: 'maintenance-fixture' },
+        accounts: { quark: { connected: true, mount: '/夸克' }, pan115: { connected: true, mount: '/115' } },
+        settings: { cacheDir: 'E:\\fixture-cache' }, paused: false,
+        jobs: [{ id: 'finished', status: 'completed', sourcePath: '/夸克/笔记.txt', targetPath: '/115', totalFiles: 1, doneFiles: 1 }],
+      };
+      let callback;
+      const fixture = window.__uiTest = {
+        calls: [], clearMode: 'pending', resetMode: 'cancel',
+        push(patch) { Object.assign(snapshot, patch); callback(structuredClone(snapshot)); },
+      };
+      window.bridge = {
+        async getState() { return structuredClone(snapshot); },
+        async list() { return { entries: [{ name: '笔记.txt', size: 10 }] }; },
+        async clearCache() {
+          fixture.calls.push('clearCache');
+          if (fixture.clearMode === 'cancel') return { cancelled: true };
+          if (fixture.clearMode === 'error') throw new Error('缓存文件正在使用，清理未完成。');
+          if (fixture.clearMode === 'partial') return { files: 1, bytes: 512, retained: 2, complete: false };
+          return new Promise(resolve => {
+            fixture.push({ maintenance: { busy: true, action: 'clear-cache' } });
+            fixture.finishClear = () => {
+              fixture.push({ maintenance: { busy: false, action: null } });
+              resolve({ files: 3, bytes: 2048, retained: 1, complete: true });
+            };
+          });
+        },
+        async resetApp() {
+          fixture.calls.push('resetApp');
+          if (fixture.resetMode === 'cancel') return { cancelled: true };
+          if (fixture.resetMode === 'error') throw new Error('部分本地设置尚未清除，请重试。');
+          return { reset: true };
+        },
+        async chooseCache() { fixture.calls.push('chooseCache'); },
+        async login() { fixture.calls.push('login'); },
+        async logout() { fixture.calls.push('logout'); },
+        async startTransfer() { fixture.calls.push('startTransfer'); },
+        async resumeQueue() { fixture.calls.push('resumeQueue'); },
+        async pauseQueue() { fixture.calls.push('pauseQueue'); },
+        async retryJob() { fixture.calls.push('retryJob'); },
+        async cancelJob() { fixture.calls.push('cancelJob'); },
+        onState(handler) { callback = handler; return () => { callback = null; }; },
+      };
+    });
+    const page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(pathToFileURL(path.resolve(__dirname, '../src/renderer/index.html')).href);
+    await page.getByLabel('选择 笔记.txt', { exact: true }).first().check();
+    await page.getByRole('button', { name: '打开设置', exact: true }).click();
+    const clear = page.locator('#clear-cache-button');
+    const reset = page.locator('#reset-app-button');
+    assert.equal(await clear.isEnabled(), true);
+    assert.equal(await reset.isEnabled(), true);
+
+    for (const status of ['paused', 'failed', 'running']) {
+      await page.evaluate(status => window.__uiTest.push({ jobs: [{ id: 'unfinished', status }] }), status);
+      assert.equal(await clear.isDisabled(), true, `${status} task blocks cleanup`);
+      assert.equal(await reset.isDisabled(), true, `${status} task blocks reset`);
+      assert.equal(await page.locator('#maintenance-task-hint').isVisible(), true);
+      await page.evaluate(() => document.getElementById('reset-app-button').dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    }
+    assert.deepEqual(await page.evaluate(() => window.__uiTest.calls), []);
+    await page.evaluate(() => window.__uiTest.push({ jobs: [{ id: 'finished', status: 'completed' }, { id: 'cancelled', status: 'cancelled' }] }));
+    await clear.click();
+    await page.waitForFunction(() => typeof window.__uiTest.finishClear === 'function');
+    assert.equal(await clear.getAttribute('aria-busy'), 'true');
+    assert.equal(await reset.isDisabled(), true);
+    assert.equal(await page.locator('#choose-cache-button').isDisabled(), true);
+    assert.equal(await page.locator('.account-button[data-side="quark"]').isDisabled(), true);
+    assert.equal(await page.locator('#copy-to-115').isDisabled(), true);
+    assert.equal(await page.locator('#browser-login-button').isDisabled(), true);
+    assert.equal(await page.locator('#logout-button').isDisabled(), true);
+    assert.equal(await page.locator('#task-list').getByRole('button', { name: '重试', exact: true }).isDisabled(), true);
+    await page.evaluate(() => {
+      window.__uiTest.push({ paused: true });
+      for (const id of ['clear-cache-button', 'reset-app-button', 'choose-cache-button', 'browser-login-button', 'logout-button', 'queue-toggle', 'copy-to-115']) {
+        document.getElementById(id).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      }
+      document.querySelector('#task-list .task-actions button').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    assert.deepEqual(await page.evaluate(() => window.__uiTest.calls), ['clearCache'], 'busy state must block duplicate or competing IPC even on synthetic clicks');
+    await page.evaluate(() => window.__uiTest.finishClear());
+    await page.waitForFunction(() => document.getElementById('maintenance-status').textContent.startsWith('缓存清理完成'));
+    assert.match(await page.locator('#maintenance-status').textContent(), /3 个文件，释放 2.0 KB/);
+    assert.match(await page.locator('#maintenance-status').textContent(), /另有 1 项未删除/);
+    assert.equal(await clear.isEnabled(), true);
+    assert.equal(await page.locator('#quark-account-status').textContent(), '已连接');
+    assert.equal(await page.locator('#pan115-account-status').textContent(), '已连接');
+    assert.equal(await page.locator('#cache-dir').inputValue(), 'E:\\fixture-cache');
+    assert.equal(await page.locator('#task-count').textContent(), '2');
+    assert.equal(await page.getByLabel('选择 笔记.txt', { exact: true }).first().isChecked(), true);
+    assert.equal(await page.locator('#copy-to-115').isEnabled(), true);
+
+    await page.evaluate(() => { window.__uiTest.clearMode = 'partial'; });
+    await clear.click();
+    await page.waitForFunction(() => document.getElementById('maintenance-status').textContent.startsWith('缓存尚未全部清理'));
+    assert.match(await page.locator('#maintenance-status.error').textContent(), /1 个文件，释放 512 B.*另有 2 项未删除/);
+    assert.equal(await clear.isEnabled(), true, 'partial cleanup permits retry');
+    await page.evaluate(() => { window.__uiTest.clearMode = 'error'; });
+    await clear.click();
+    await page.getByText('缓存文件正在使用，清理未完成。', { exact: true }).waitFor();
+    assert.equal(await clear.isEnabled(), true, 'failed cleanup permits retry');
+    await page.evaluate(() => { window.__uiTest.clearMode = 'cancel'; });
+    await clear.click();
+    await page.getByText('已取消清理缓存。', { exact: true }).waitFor();
+    assert.equal(await clear.isEnabled(), true);
+    assert.equal(await page.getByLabel('选择 笔记.txt', { exact: true }).first().isChecked(), true);
+
+    await reset.click();
+    await page.getByText('已取消重置，本地数据未改变。', { exact: true }).waitFor();
+    assert.equal(await reset.isEnabled(), true);
+    assert.equal(await page.locator('#task-count').textContent(), '2');
+    assert.equal(await page.locator('#quark-account-status').textContent(), '已连接');
+    await page.evaluate(() => { window.__uiTest.resetMode = 'error'; });
+    await reset.click();
+    await page.getByText('部分本地设置尚未清除，请重试。', { exact: true }).waitFor();
+    assert.equal(await reset.isEnabled(), true);
+    await page.evaluate(() => window.__uiTest.push({ engine: { status: 'error', error: '测试本地服务启动失败' } }));
+    assert.equal(await reset.isEnabled(), true, 'reset remains available after engine startup failure');
+    await page.evaluate(() => window.__uiTest.push({ maintenance: { busy: false, action: null, resetStarted: true } }));
+    assert.equal(await clear.isDisabled(), true, 'partially applied reset only permits completing reset');
+    assert.equal(await reset.isEnabled(), true, 'partial reset failure can be retried');
+    await page.evaluate(() => {
+      window.__uiTest.push({ engine: { status: 'ready' } });
+      document.getElementById('clear-cache-button').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    assert.equal(await page.locator('.account-button[data-side="quark"]').isDisabled(), true, 'late ready event cannot reopen accounts after partial reset');
+    assert.equal(await page.locator('#copy-to-115').isDisabled(), true);
+    assert.equal(await reset.isEnabled(), true);
+    assert.equal(await page.evaluate(() => window.__uiTest.calls.filter(call => call === 'clearCache').length), 4, 'partial reset blocks synthetic cleanup clicks');
+    if (process.env.UI_TEST_MAINTENANCE_SCREENSHOT) await page.screenshot({ path: process.env.UI_TEST_MAINTENANCE_SCREENSHOT });
+    await page.evaluate(() => { window.__uiTest.resetMode = 'success'; });
+    await reset.click();
+    await page.getByText('重置完成，程序即将关闭。下次打开后请重新连接网盘。', { exact: true }).waitFor();
+    await page.evaluate(() => window.__uiTest.push({ engine: { status: 'ready' }, maintenance: { busy: false, action: null }, jobs: [] }));
+    assert.equal(await reset.isDisabled(), true, 'successful reset remains locked until process exits');
+    assert.equal(await clear.isDisabled(), true);
+    assert.equal(await page.locator('#copy-to-115').isDisabled(), true);
+    assert.deepEqual(errors, []);
     await context.close();
   } finally { await browser.close(); }
 });

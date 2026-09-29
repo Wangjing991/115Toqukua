@@ -14,6 +14,7 @@
     accountRevision: { quark: 0, pan115: 0 },
     logoutPending: new Set(),
     authPending: new Set(),
+    maintenancePending: null,
     pendingCopy: null,
     jobsSignature: '',
     toastTimer: null,
@@ -28,7 +29,9 @@
   };
   const number = value => Math.max(0, Number(value) || 0);
   const account = side => model.snapshot.accounts?.[side] || {};
-  const ready = () => Boolean(api && model.snapshot.engine?.status === 'ready');
+  const maintenanceBusy = () => Boolean(model.maintenancePending || model.snapshot.maintenance?.busy);
+  const ready = () => Boolean(api && model.snapshot.engine?.status === 'ready' && !maintenanceBusy() && !model.snapshot.maintenance?.resetStarted);
+  const hasUnfinishedTasks = () => (model.snapshot.jobs || []).some(job => !['completed', 'cancelled'].includes(job.status));
   const rootPath = side => account(side).mount || (side === 'quark' ? '/夸克' : '/115');
   const trimPath = path => String(path || '/').replace(/\/+$/, '') || '/';
   const joinPath = (base, name) => `${trimPath(base) === '/' ? '' : trimPath(base)}/${name}`;
@@ -69,7 +72,9 @@
     button.disabled = true;
     try { return await action(); }
     catch (error) { toast(errorMessage(error), true); return undefined; }
-    finally { if (button.isConnected) button.disabled = false; }
+    finally {
+      if (button.isConnected) button.disabled = (!ready() && button.textContent !== '查看原因') || (button.id === 'choose-cache-button' && hasUnfinishedTasks());
+    }
   }
 
   function paintEngine() {
@@ -88,7 +93,7 @@
     byId('startup-logs').hidden = !isError;
     byId('version-label').textContent = engine.version ? `OpenList ${engine.version}` : 'OpenList 本地服务';
     byId('cache-dir').value = model.snapshot.settings?.cacheDir || '';
-    byId('choose-cache-button').disabled = !api;
+    byId('choose-cache-button').disabled = !ready() || hasUnfinishedTasks();
     document.querySelectorAll('[data-action="account"]').forEach(button => { button.disabled = !ready(); });
   }
 
@@ -206,6 +211,7 @@
   }
 
   function selectEntry(side, name, selected) {
+    if (!ready()) return;
     const pane = model.panes[side];
     if (selected) pane.selected.add(name); else pane.selected.delete(name);
     updateSelection(side);
@@ -218,6 +224,9 @@
       const selected = pane.selected.has(pane.entries[index]?.name);
       row.classList.toggle('selected', selected);
       row.querySelector('input').checked = selected;
+      row.querySelector('input').disabled = !ready();
+      const openButton = row.querySelector('.file-open');
+      if (openButton) openButton.disabled = !ready();
     });
     const selectAll = byId(`${side}-select-all`);
     selectAll.disabled = !ready() || !account(side).connected || pane.loading || Boolean(pane.error) || !pane.entries.length;
@@ -267,7 +276,7 @@
 
   function paintJobs() {
     const jobs = model.snapshot.jobs || [];
-    const signature = JSON.stringify([model.snapshot.engine?.status, model.snapshot.paused, jobs]);
+    const signature = JSON.stringify([model.snapshot.engine?.status, model.snapshot.paused, maintenanceBusy(), jobs]);
     if (signature === model.jobsSignature) return;
     model.jobsSignature = signature;
     byId('task-count').textContent = String(jobs.length);
@@ -347,6 +356,7 @@
   }
 
   async function runJobAction(method, id) {
+    if (!ready()) return;
     await call(method, id);
     if (method === 'retryJob') toast('已提交重试，已完成的文件会保留。');
     else toast('已请求取消该任务。');
@@ -388,7 +398,10 @@
       if (!info.connected && prior.connected) {
         resetPane(side);
       } else if (info.connected && ready() && (!prior.connected || previous.engine?.status !== 'ready' || prior.mount !== info.mount)) {
-        loadDirectory(side, prior.mount === info.mount && pane.path ? pane.path : rootPath(side), true);
+        // Use OpenList's directory cache on first paint. Explicit refresh and
+        // completed transfers still request fresh data, avoiding two full
+        // remote scans immediately after a large account is connected.
+        loadDirectory(side, prior.mount === info.mount && pane.path ? pane.path : rootPath(side), false);
       } else if (!info.connected) {
         paintPane(side);
       } else {
@@ -398,6 +411,7 @@
     }
     paintJobs();
     paintAccountControls();
+    paintMaintenance();
     updateCopyButtons();
     const newlyCompleted = (snapshot.jobs || []).filter(job => job.status === 'completed' && previousJobs.has(job.id) && previousJobs.get(job.id) !== 'completed');
     for (const side of sides) {
@@ -428,6 +442,7 @@
   }
 
   function openAccount(side) {
+    if (!ready()) return;
     model.accountSide = side;
     clearCredentials();
     byId('account-dialog-title').textContent = `${account(side).connected ? '管理' : '连接'}${labels[side]}网盘`;
@@ -482,7 +497,7 @@
   async function browserLogin() {
     const status = byId('login-message');
     const side = model.accountSide;
-    if (model.logoutPending.has(side) || model.authPending.has(side)) return;
+    if (!ready() || model.logoutPending.has(side) || model.authPending.has(side)) return;
     const revision = model.accountRevision[side];
     model.authPending.add(side);
     status.classList.remove('error');
@@ -503,7 +518,7 @@
   async function saveCredentials(event) {
     event.preventDefault();
     const side = model.accountSide;
-    if (model.logoutPending.has(side) || model.authPending.has(side)) return;
+    if (!ready() || model.logoutPending.has(side) || model.authPending.has(side)) return;
     const revision = model.accountRevision[side];
     const cookie = byId('cookie-input').value.trim();
     const accessToken = byId('access-token-input').value.trim();
@@ -547,7 +562,7 @@
   }
 
   async function confirmCopy() {
-    if (!model.pendingCopy) return;
+    if (!model.pendingCopy || !ready()) return;
     const request = model.pendingCopy;
     const button = byId('confirm-copy-button');
     button.disabled = true;
@@ -561,7 +576,72 @@
       toast('已加入传输任务，将先扫描目录并检查缓存空间。');
       await refreshState();
     } catch (error) { byId('copy-error').textContent = errorMessage(error); }
-    finally { button.disabled = false; }
+    finally { button.disabled = !ready(); }
+  }
+
+  function paintMaintenance() {
+    const busy = maintenanceBusy();
+    const action = model.maintenancePending || model.snapshot.maintenance?.action;
+    const unfinished = hasUnfinishedTasks();
+    const available = api && ['ready', 'error'].includes(model.snapshot.engine?.status);
+    byId('clear-cache-button').disabled = !available || busy || unfinished || Boolean(model.snapshot.maintenance?.resetStarted);
+    byId('reset-app-button').disabled = !available || busy || unfinished;
+    byId('clear-cache-button').textContent = busy && action === 'clear-cache' ? '正在清理…' : '清理缓存';
+    byId('reset-app-button').textContent = busy && action === 'reset-app' ? '正在重置…' : '完整重置';
+    byId('clear-cache-button').setAttribute('aria-busy', String(busy && action === 'clear-cache'));
+    byId('reset-app-button').setAttribute('aria-busy', String(busy && action === 'reset-app'));
+    byId('maintenance-task-hint').hidden = !unfinished;
+    byId('confirm-copy-button').disabled = !ready();
+    byId('manual-toggle').disabled = busy;
+    ['cookie-input', 'access-token-input', 'refresh-token-input'].forEach(id => { byId(id).disabled = busy; });
+  }
+
+  function paintOperationControls() {
+    paintEngine();
+    for (const side of sides) { paintAccount(side); paintPath(side); updateSelection(side); }
+    paintAccountControls();
+    paintJobs();
+    paintMaintenance();
+  }
+
+  async function maintainLocalData(action) {
+    if (!api || maintenanceBusy() || hasUnfinishedTasks()) return;
+    if (action === 'clear-cache' && model.snapshot.maintenance?.resetStarted) return;
+    const status = byId('maintenance-status');
+    model.maintenancePending = action;
+    paintOperationControls();
+    status.classList.remove('error');
+    status.textContent = action === 'reset-app' ? '请在确认窗口中选择是否完整重置。' : '请确认清理缓存，确认后请等待清理完成。';
+    let resetComplete = false;
+    try {
+      const result = await call(action === 'reset-app' ? 'resetApp' : 'clearCache');
+      if (result?.cancelled) {
+        status.textContent = action === 'reset-app'
+          ? model.snapshot.maintenance?.resetStarted ? '已取消本次重置。此前未完成的重置仍需重试。' : '已取消重置，本地数据未改变。'
+          : '已取消清理缓存。';
+      } else if (action === 'reset-app') {
+        if (!result?.reset) throw new Error('重置结果未确认，请查看日志后重试。');
+        resetComplete = true;
+        clearCredentials();
+        for (const side of sides) { ++model.accountRevision[side]; resetPane(side); }
+        status.textContent = '重置完成，程序即将关闭。下次打开后请重新连接网盘。';
+      } else {
+        if (!result || !Number.isFinite(result.files) || !Number.isFinite(result.bytes)) throw new Error('缓存清理结果未确认，请查看日志后重试。');
+        const retained = number(result.retained);
+        const complete = result.complete !== false;
+        status.classList.toggle('error', !complete);
+        status.textContent = `${complete ? '缓存清理完成' : '缓存尚未全部清理'}：已删除 ${number(result.files).toLocaleString('zh-CN')} 个文件，释放 ${bytes(result.bytes)}。账号、任务记录和设置已保留。${retained ? `另有 ${retained.toLocaleString('zh-CN')} 项未删除，包含不属于本程序或无法安全清理的内容。` : ''}${complete ? '' : '请查看日志后重试。'}`;
+      }
+    } catch (error) {
+      status.classList.add('error');
+      status.textContent = errorMessage(error);
+    } finally {
+      if (!resetComplete) model.maintenancePending = null;
+      paintOperationControls();
+      for (const side of sides) {
+        if (ready() && account(side).connected && !model.panes[side].loaded && !model.panes[side].loading) loadDirectory(side, model.panes[side].path, false);
+      }
+    }
   }
 
   function bindEvents() {
@@ -574,6 +654,7 @@
     document.querySelectorAll('[data-action="refresh"]').forEach(button => button.addEventListener('click', () => loadDirectory(button.dataset.side, model.panes[button.dataset.side].path, true)));
     for (const side of sides) {
       byId(`${side}-select-all`).addEventListener('change', event => {
+        if (!ready()) return;
         const pane = model.panes[side];
         pane.selected = event.target.checked ? new Set(pane.entries.map(entry => entry.name)) : new Set();
         updateSelection(side);
@@ -596,14 +677,18 @@
     byId('confirm-copy-button').addEventListener('click', confirmCopy);
     byId('settings-button').addEventListener('click', () => byId('settings-dialog').showModal());
     byId('choose-cache-button').addEventListener('click', () => withButton(byId('choose-cache-button'), async () => {
+      if (!ready() || hasUnfinishedTasks()) return;
       await call('chooseCache');
       await refreshState();
     }));
+    byId('clear-cache-button').addEventListener('click', () => maintainLocalData('clear-cache'));
+    byId('reset-app-button').addEventListener('click', () => maintainLocalData('reset-app'));
     const openFolder = kind => call('openFolder', { kind }).catch(error => toast(errorMessage(error), true));
     document.querySelectorAll('[data-open-folder]').forEach(button => button.addEventListener('click', () => openFolder(button.dataset.openFolder)));
     byId('logs-button').addEventListener('click', () => openFolder('logs'));
     byId('startup-logs').addEventListener('click', () => openFolder('logs'));
     byId('queue-toggle').addEventListener('click', async () => {
+      if (!ready()) return;
       byId('queue-toggle').disabled = true;
       try {
         await call(model.snapshot.paused ? 'resumeQueue' : 'pauseQueue');

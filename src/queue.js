@@ -20,8 +20,8 @@ class Queue extends EventEmitter {
     }
     this.save();
   }
-  save() { this.store.data.jobs = this.jobs; this.store.save(); }
-  changed(persist = true) { if (persist) this.save(); this.emit('change'); }
+  save() { if (this.retired) return; this.store.data.jobs = this.jobs; this.store.save(); }
+  changed(persist = true) { if (this.retired) return; if (persist) this.save(); this.emit('change'); }
   progress() { if (Date.now() - this.lastEmit > 250) { this.lastEmit = Date.now(); this.changed(false); } }
   summaries() { return this.jobs.map(j => {
     const entries = j.entries || [], done = entries.filter(e => e.status === 'completed'), failures = entries.filter(e => e.status === 'failed');
@@ -83,7 +83,7 @@ class Queue extends EventEmitter {
     if (!check.entries.some(e => e.name === base && e.is_dir)) throw new Error(`未能确认文件夹已建立：${dir}`);
   }
   kick() {
-    if (this.running || this.paused) return;
+    if (this.retired || this.running || this.paused) return;
     this.running = true;
     this.runPromise = this.run().catch(error => {
       this.paused = true;
@@ -269,7 +269,16 @@ class Queue extends EventEmitter {
     this.changed();
   }
   hasUnfinished() { return this.pendingCleanups > 0 || this.jobs.some(j => !['completed', 'cancelled'].includes(j.status)); }
+  retire() {
+    if (this.running || this.hasUnfinished()) throw new Error('请先完成或取消现有任务');
+    this.retired = true; this.paused = true;
+    // A cancelled directory request may still settle after reset. Invalidate its
+    // callback before tasks.json is removed, so it cannot recreate old history.
+    for (const job of this.jobs) job.planGeneration = (job.planGeneration || 0) + 1;
+    this.removeAllListeners();
+  }
   async stop() {
+    if (this.retired) return;
     this.pause(); this.abort?.abort();
     let timeout;
     try { await Promise.race([this.runPromise || Promise.resolve(), new Promise(resolve => { timeout = setTimeout(resolve, 3000); })]); }
