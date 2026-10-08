@@ -101,12 +101,13 @@ else {
     }
     return accounts.save(side, async () => {
       await engine.saveCredentials(credentials);
-      state.accounts[side].connected = false; state.accounts[side].message = '正在验证目录读取'; broadcast();
-      // Explicitly probe reading: a saved storage record alone does not establish connectivity.
-      try { await engine.list({ path: MOUNTS[side], refresh: true }); }
-      catch (error) { state.accounts[side].connected = false; state.accounts[side].message = redact(error); broadcast(); throw error; }
       await updateAccounts();
-      state.accounts[side].connected = true; state.accounts[side].message = '已连接';
+      // OpenList initializes 115 Open by validating the tokens with UserInfo.
+      // Do not enumerate the root here: that driver fetches every remote page
+      // before /fs/list can paginate, so a large account can exceed the listing
+      // timeout even though authentication already succeeded.
+      if (!state.accounts[side].connected) throw new Error(state.accounts[side].message || '账号验证未通过');
+      state.accounts[side].message = '已连接'; broadcast();
       log(`${side === 'quark' ? '夸克' : '115'}连接成功`);
       return { connected: true };
     }, revision);

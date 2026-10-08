@@ -51,7 +51,7 @@ function fixture(options = {}) {
     destroy() { this.destroyed = true; this.emit('closed'); }
   }
   class FakeEngine extends EventEmitter {
-    constructor() { super(); this.status = 'stopped'; calls.push('engine.create'); }
+    constructor() { super(); this.status = 'stopped'; this.configured = false; calls.push('engine.create'); }
     setStatus(status) { this.status = status; this.emit('status', { status }); }
     async start() {
       calls.push('engine.start'); this.setStatus('starting'); await options.start;
@@ -60,7 +60,9 @@ function fixture(options = {}) {
       this.setStatus('ready'); calls.push('engine.started');
     }
     async stop() { calls.push('engine.stop'); this.setStatus('stopped'); }
-    async getAccounts() { await options.getAccounts; return { quark: { connected: false }, pan115: { connected: false } }; }
+    async saveCredentials() { calls.push('engine.saveCredentials'); this.configured = true; }
+    async list() { calls.push('engine.list'); if (options.listError) throw options.listError; return { entries: [] }; }
+    async getAccounts() { await options.getAccounts; return { quark: { connected: false }, pan115: { connected: this.configured } }; }
   }
   class FakeQueue extends EventEmitter {
     constructor({ store }) { super(); this.store = store; this.running = false; calls.push('queue.create'); }
@@ -140,6 +142,16 @@ test('the explicit close command starts shutdown and finishes with a process exi
   await f.flush();
   assert.equal(f.calls.includes('engine.stop'), true);
   assert.equal(f.calls.includes('exit:0'), true);
+});
+
+test('115 login succeeds after storage validation even when its large root directory cannot be enumerated', async () => {
+  const f = fixture({ listError: new Error('large root listing exceeded the directory timeout') });
+  await f.ready();
+  const result = await f.invoke('save-credentials', { side: 'pan115', accessToken: 'fixture-access', refreshToken: 'fixture-refresh' });
+  assert.equal(result.connected, true);
+  assert.equal(f.calls.includes('engine.saveCredentials'), true);
+  assert.equal(f.calls.includes('engine.list'), false, 'login must not enumerate every item in the root directory');
+  assert.equal((await f.invoke('get-state')).accounts.pan115.connected, true);
 });
 
 test('launch after the main window is destroyed does not call destroyed native methods', async () => {
